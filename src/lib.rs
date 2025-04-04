@@ -120,7 +120,7 @@ pub unsafe extern "C" fn upload_save_to_server(
     let form = reqwest::blocking::multipart::Form::new()
         .text("user_secret", user_secret.to_string())
         .text("product_id", package_id.to_string())
-        .part("save_data", part);
+        .part("save_file", part);
     
     let client = reqwest::blocking::Client::new();
     let resp = client.post(URL)
