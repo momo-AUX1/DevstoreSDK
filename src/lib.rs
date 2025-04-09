@@ -73,7 +73,7 @@ fn get_pref_path() -> PathBuf {
         Err(_) => {
             eprintln!("Error: Failed to create directory");
             path
-        }
+        } 
     }
     
 }
