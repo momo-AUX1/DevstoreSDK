@@ -66,9 +66,16 @@ fn get_pref_path() -> PathBuf {
     }
 
     // Fallback if SDL not available or not initialized
-    let mut base = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.push("xbdev_devstoreSDK");
-    base
+    let mut path = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push("xbdev_devstoreSDK");
+    match fs::create_dir_all(&path) {
+        Ok(_) => path,
+        Err(_) => {
+            eprintln!("Error: Failed to create directory");
+            path
+        }
+    }
+    
 }
 
 fn get_cache_file_path() -> PathBuf {
@@ -471,11 +478,25 @@ pub extern "C" fn check_and_show_notification(product_id: *const c_char) -> *mut
 
 
 #[unsafe(no_mangle)]
-pub extern "C" fn init_simple_loop(product_id: *const c_char) -> *mut c_char {
+extern "C" fn init_simple_loop(product_id: *const c_char) -> *mut c_char {
+    //_local_state_path: *const c_char
     // simple loop, this will be expanded to a more complex loop as the SDK grows.
     if product_id.is_null() {
         return string_to_c_char("Error: Missing product_id parameter".to_string());
     }
+
+    /*if local_state_path.is_null() {
+        return string_to_c_char("Error: Missing local_state_path parameter".to_string());
+    }
+
+    let local_state_path = unsafe {
+        match CStr::from_ptr(local_state_path).to_str() {
+            Ok(s) if !s.is_empty() => s,
+            _ => return string_to_c_char("Error: Invalid local_state_path parameter".to_string()),
+        }
+    };
+
+    unsafe { std::env::set_var("LOCAL_STATE_PATH", local_state_path) };*/
 
     let c_str = unsafe { CStr::from_ptr(product_id) };
     let id = match c_str.to_str() {
