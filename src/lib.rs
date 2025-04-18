@@ -26,13 +26,6 @@ fn string_to_c_char(s: String) -> *mut c_char {
     CString::new(s).unwrap().into_raw()
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn free_c_string(s: *mut c_char) {
-    if s.is_null() { return; }
-    unsafe { let _ = CString::from_raw(s); }
-}
-
-
 fn is_sdl_available() -> bool {
     let candidates = if cfg!(target_os = "windows") {
         vec!["SDL2.dll"]
@@ -50,7 +43,6 @@ fn is_sdl_available() -> bool {
 fn is_sdl_initialized() -> bool {
     unsafe { sdl2::sys::SDL_WasInit(0) != 0 }
 }
-
 
 fn get_pref_path() -> PathBuf {
     if is_sdl_available() && is_sdl_initialized() {
@@ -326,7 +318,7 @@ pub unsafe extern "C" fn download_save_from_server(
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn get_version_from_id(
+pub extern "C" fn get_version_from_id(
     package_id: *const c_char
 ) -> *mut c_char {
     if package_id.is_null() {
@@ -475,10 +467,8 @@ pub extern "C" fn check_and_show_notification(product_id: *const c_char) -> *mut
     }
 }
 
-
-
 #[unsafe(no_mangle)]
-extern "C" fn init_simple_loop(product_id: *const c_char) -> *mut c_char {
+pub extern "C" fn init_simple_loop(product_id: *const c_char) -> *mut c_char {
     //_local_state_path: *const c_char
     // simple loop, this will be expanded to a more complex loop as the SDK grows.
     if product_id.is_null() {
@@ -515,4 +505,100 @@ extern "C" fn init_simple_loop(product_id: *const c_char) -> *mut c_char {
     string_to_c_char("Background notification loop started.".to_string())
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn free_c_string(s: *mut c_char) {
+    if s.is_null() { return; }
+    unsafe { let _ = CString::from_raw(s); }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn is_devstore_online() -> *mut c_char {
+    let client = reqwest::blocking::Client::new();
+    let req = client.get(format!("{}status-check", URL)).send();
+    match req {
+        Ok(response) => {
+            let status = response.status();
+
+            match status.as_u16() {
+                200 => string_to_c_char("0".to_string()),
+                503 => string_to_c_char("1".to_string()),
+                _ => string_to_c_char("2".to_string()),
+            }
+        }
+
+        Err(_) => {
+            string_to_c_char("2".to_string())
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn get_current_username(user_secret: *const c_char) -> *mut c_char {
+    if user_secret.is_null() {
+        return string_to_c_char("Error: Missing user_secret parameter".to_string());
+    }
+
+    let user_secret = unsafe {
+        match CStr::from_ptr(user_secret).to_str() {
+            Ok(s) if !s.is_empty() => s,
+            _ => return string_to_c_char("Error: Invalid user_secret parameter".to_string()),
+        }
+    };
+
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .post(format!("{}get-username-by-secret/", URL))
+        .form(&[("user_secret", user_secret)])
+        .send();
+
+    match resp {
+        Ok(response) => {
+            let status = response.status();
+            let text = response
+                .text()
+                .unwrap_or_else(|_| "No response message".to_string());
+
+            if !status.is_success() {
+                return string_to_c_char(format!(
+                    "Error: Request failed (status {}): {}",
+                    status.as_u16(),
+                    text
+                ));
+            }
+
+            let json: Value = match serde_json::from_str(&text) {
+                Ok(j) => j,
+                Err(e) => {
+                    return string_to_c_char(format!(
+                        "Error: Failed to parse response JSON: {}",
+                        e
+                    ))
+                }
+            };
+
+            match json.get("status").and_then(Value::as_str) {
+                Some("success") => {
+                    match json.get("username").and_then(Value::as_str) {
+                        Some(username) => string_to_c_char(username.to_string()),
+                        None => string_to_c_char("Error: Username missing in response".to_string()),
+                    }
+                }
+                Some("error") => {
+                    let msg = json
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Unknown error");
+                    string_to_c_char(format!("Error: Server error: {}", msg))
+                }
+                Some(other) => {
+                    string_to_c_char(format!("Error: Unexpected status in response: {}", other))
+                }
+                None => string_to_c_char("Error: Missing status in response".to_string()),
+            }
+        }
+        Err(e) => {
+            string_to_c_char(format!("Error: Network error: {}", e))
+        }
+    }
+}
 // end of main functions
