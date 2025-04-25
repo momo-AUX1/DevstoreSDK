@@ -601,4 +601,84 @@ pub extern "C" fn get_current_username(user_secret: *const c_char) -> *mut c_cha
         }
     }
 }
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn download_update_for_product(
+    package_id: *const c_char
+) -> *mut c_char {
+    if package_id.is_null() {
+        return string_to_c_char("Error: Missing package_id parameter".to_string());
+    }
+    let package_id = match CStr::from_ptr(package_id).to_str() {
+        Ok(s) if !s.is_empty() => s,
+        _ => return string_to_c_char("Error: Invalid package_id parameter".to_string()),
+    };
+
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get(format!("{}get-latest-patch/?product_id={}", URL, package_id))
+        .send();
+
+    let response = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            return string_to_c_char(format!("Error: Network error: {}", e));
+        }
+    };
+
+    if !response.status().is_success() {
+        let txt = response.text().unwrap_or_else(|_| "No response message".to_string());
+        return string_to_c_char(format!("Error: Request failed: {}", txt));
+    }
+
+    let bytes = match response.bytes() {
+        Ok(b) => b,
+        Err(e) => return string_to_c_char(format!("Error: Failed to read response bytes: {}", e)),
+    };
+
+    let mut update_path = get_pref_path();    
+    update_path.push("update");
+    if update_path.exists() {
+        if let Err(e) = fs::remove_dir_all(&update_path) {
+            return string_to_c_char(format!("Error: Failed to remove old update dir: {}", e));
+        }
+    }
+    if let Err(e) = fs::create_dir_all(&update_path) {
+        return string_to_c_char(format!("Error: Failed to create update dir: {}", e));
+    }
+    let cursor = io::Cursor::new(bytes);
+    let mut zip_archive = match zip::ZipArchive::new(cursor) {
+        Ok(z) => z,
+        Err(e) => return string_to_c_char(format!("Error: Failed to open zip archive: {}", e)),
+    };
+
+    for i in 0..zip_archive.len() {
+        let mut file = match zip_archive.by_index(i) {
+            Ok(f)  => f,
+            Err(e) => return string_to_c_char(format!("Error: Failed to access file in zip: {}", e)),
+        };
+        let outpath = update_path.join(Path::new(file.name()));
+        if file.name().ends_with('/') {
+            if let Err(e) = fs::create_dir_all(&outpath) {
+                return string_to_c_char(format!("Error: Failed to create directory: {}", e));
+            }
+        } else {
+            if let Some(p) = outpath.parent() {
+                if !p.exists() && fs::create_dir_all(p).is_err() {
+                    return string_to_c_char("Error: Failed to create parent directory".to_string());
+                }
+            }
+            let mut outfile = match fs::File::create(&outpath) {
+                Ok(f)  => f,
+                Err(e) => return string_to_c_char(format!("Error: Failed to create file: {}", e)),
+            };
+            if io::copy(&mut file, &mut outfile).is_err() {
+                return string_to_c_char("Error: Failed to write file contents".to_string());
+            }
+        }
+    }
+
+    string_to_c_char("Update downloaded and extracted successfully.".to_string())
+}
+
 // end of main functions
