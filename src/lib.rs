@@ -616,7 +616,8 @@ pub unsafe extern "C" fn download_update_for_product(
 
     let client = reqwest::blocking::Client::new();
     let resp = client
-        .get(format!("{}get-latest-patch/?product_id={}", URL, package_id))
+        .post(format!("{}get_latest_patch/", URL)) 
+        .form(&[("product_id", package_id)])       
         .send();
 
     let response = match resp {
@@ -636,7 +637,7 @@ pub unsafe extern "C" fn download_update_for_product(
         Err(e) => return string_to_c_char(format!("Error: Failed to read response bytes: {}", e)),
     };
 
-    let mut update_path = get_pref_path();    
+    let mut update_path = get_pref_path();
     update_path.push("update");
     if update_path.exists() {
         if let Err(e) = fs::remove_dir_all(&update_path) {
@@ -646,6 +647,7 @@ pub unsafe extern "C" fn download_update_for_product(
     if let Err(e) = fs::create_dir_all(&update_path) {
         return string_to_c_char(format!("Error: Failed to create update dir: {}", e));
     }
+
     let cursor = io::Cursor::new(bytes);
     let mut zip_archive = match zip::ZipArchive::new(cursor) {
         Ok(z) => z,
@@ -654,7 +656,7 @@ pub unsafe extern "C" fn download_update_for_product(
 
     for i in 0..zip_archive.len() {
         let mut file = match zip_archive.by_index(i) {
-            Ok(f)  => f,
+            Ok(f) => f,
             Err(e) => return string_to_c_char(format!("Error: Failed to access file in zip: {}", e)),
         };
         let outpath = update_path.join(Path::new(file.name()));
@@ -669,7 +671,7 @@ pub unsafe extern "C" fn download_update_for_product(
                 }
             }
             let mut outfile = match fs::File::create(&outpath) {
-                Ok(f)  => f,
+                Ok(f) => f,
                 Err(e) => return string_to_c_char(format!("Error: Failed to create file: {}", e)),
             };
             if io::copy(&mut file, &mut outfile).is_err() {
@@ -680,5 +682,4 @@ pub unsafe extern "C" fn download_update_for_product(
 
     string_to_c_char("Update downloaded and extracted successfully.".to_string())
 }
-
 // end of main functions
