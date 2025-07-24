@@ -110,6 +110,14 @@ fn save_notification_cache(cache: &HashSet<u32>) {
 // Main functions that are exposed to C
 
 #[unsafe(no_mangle)]
+pub extern "C" fn get_sdk_version() -> *mut c_char {
+    const RAW_TOML: &str = include_str!("../Cargo.toml");
+    let toml: Value = toml::from_str(RAW_TOML).unwrap();
+    let version = toml.get("package").and_then(|p| p.get("version")).and_then(Value::as_str).unwrap_or("Unknown version");
+    string_to_c_char(version.to_string())
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn upload_save_to_server(
     package_id: *const c_char,
     user_secret: *const c_char,
