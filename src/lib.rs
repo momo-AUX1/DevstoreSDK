@@ -798,7 +798,7 @@ pub unsafe extern "C" fn download_update_for_product(package_id: *const c_char) 
 
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn verify_download(package_id: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn verify_download_v2(package_id: *const c_char) -> *mut c_char {
     if package_id.is_null() {
         return string_to_c_char("Error: Missing package_id parameter".to_string());
     }
