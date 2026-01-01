@@ -1,4 +1,5 @@
 use libloading::Library;
+use once_cell::sync::Lazy;
 use rand::{Rng, thread_rng};
 use reqwest;
 use serde::{Deserialize, Serialize};
@@ -11,10 +12,125 @@ use std::io::{self, Write};
 use std::os::raw::c_char;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::RwLock;
 use walkdir::WalkDir;
 use zip;
 
-const URL: &str = "https://xbdev.store/api/";
+#[repr(u32)]
+#[derive(Copy, Clone)]
+pub enum DevstoreMessageStatus {
+    Info = 0,
+    Success = 1,
+    Warning = 2,
+    Error = 3,
+}
+
+#[repr(C)]
+pub struct DevstoreFfiMessage {
+    pub status: DevstoreMessageStatus,
+    pub code: u32,
+    pub message: *mut c_char,
+}
+
+fn sanitize_message(text: impl Into<String>) -> CString {
+    let mut cleaned = text.into();
+    cleaned = cleaned.replace('\0', " ");
+    CString::new(cleaned)
+        .unwrap_or_else(|_| CString::new("Message contained invalid bytes").unwrap())
+}
+
+fn build_message(
+    status: DevstoreMessageStatus,
+    code: u32,
+    text: impl Into<String>,
+) -> *mut DevstoreFfiMessage {
+    let c_message = sanitize_message(text);
+    let pointer = c_message.into_raw();
+    let container = DevstoreFfiMessage {
+        status,
+        code,
+        message: pointer,
+    };
+    Box::into_raw(Box::new(container))
+}
+
+fn message_success(text: impl Into<String>) -> *mut DevstoreFfiMessage {
+    build_message(DevstoreMessageStatus::Success, 0, text)
+}
+
+fn message_info(text: impl Into<String>) -> *mut DevstoreFfiMessage {
+    build_message(DevstoreMessageStatus::Info, 0, text)
+}
+
+fn message_warning(text: impl Into<String>) -> *mut DevstoreFfiMessage {
+    build_message(DevstoreMessageStatus::Warning, 0, text)
+}
+
+fn message_error(text: impl Into<String>) -> *mut DevstoreFfiMessage {
+    build_message(DevstoreMessageStatus::Error, 0, text)
+}
+
+fn message_with_code(
+    status: DevstoreMessageStatus,
+    code: u32,
+    text: impl Into<String>,
+) -> *mut DevstoreFfiMessage {
+    build_message(status, code, text)
+}
+
+fn missing_param(name: &str) -> *mut DevstoreFfiMessage {
+    message_error(format!("Missing {} parameter", name))
+}
+
+fn invalid_param(name: &str) -> *mut DevstoreFfiMessage {
+    message_error(format!("Invalid {} parameter", name))
+}
+
+fn parse_c_string<'a>(
+    value: *const c_char,
+    name: &str,
+) -> Result<&'a str, *mut DevstoreFfiMessage> {
+    if value.is_null() {
+        return Err(missing_param(name));
+    }
+    let cstr = unsafe { CStr::from_ptr(value) };
+    match cstr.to_str() {
+        Ok(s) if !s.is_empty() => Ok(s),
+        _ => Err(invalid_param(name)),
+    }
+}
+
+fn drop_message(ptr: *mut DevstoreFfiMessage) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let stored = Box::from_raw(ptr);
+        if !stored.message.is_null() {
+            let _ = CString::from_raw(stored.message);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn devstore_free_message(message: *mut DevstoreFfiMessage) {
+    drop_message(message);
+}
+
+static API_URL: Lazy<RwLock<String>> =
+    Lazy::new(|| RwLock::new("https://xbdev.store/api/".to_string()));
+
+fn normalize_url(url: &str) -> String {
+    if url.ends_with('/') {
+        url.to_string()
+    } else {
+        format!("{}/", url)
+    }
+}
+
+fn api_base_url() -> String {
+    API_URL.read().unwrap().clone()
+}
 
 #[derive(Serialize, Deserialize)]
 struct NotificationCache {
@@ -22,10 +138,6 @@ struct NotificationCache {
 }
 
 // Helper functions that are internal to the library
-
-fn string_to_c_char(s: String) -> *mut c_char {
-    CString::new(s).unwrap().into_raw()
-}
 
 fn is_sdl_available() -> bool {
     let candidates = if cfg!(target_os = "windows") {
@@ -110,11 +222,27 @@ fn save_notification_cache(cache: &HashSet<u32>) {
 // Main functions that are exposed to C
 
 #[unsafe(no_mangle)]
-pub extern "C" fn get_sdk_version() -> *mut c_char {
+pub extern "C" fn get_sdk_version() -> *mut DevstoreFfiMessage {
     const RAW_TOML: &str = include_str!("../Cargo.toml");
     let toml: Value = toml::from_str(RAW_TOML).unwrap();
-    let version = toml.get("package").and_then(|p| p.get("version")).and_then(Value::as_str).unwrap_or("Unknown version");
-    string_to_c_char(version.to_string())
+    let version = toml
+        .get("package")
+        .and_then(|p| p.get("version"))
+        .and_then(Value::as_str)
+        .unwrap_or("Unknown version");
+    message_success(version.to_string())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn set_custom_url(custom_url: *const c_char) -> *mut DevstoreFfiMessage {
+    let parsed_url = match parse_c_string(custom_url, "custom_url") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let normalized = normalize_url(parsed_url);
+    let mut guard = API_URL.write().unwrap();
+    *guard = normalized.clone();
+    message_success(format!("Custom URL set to {}", normalized))
 }
 
 #[unsafe(no_mangle)]
@@ -122,43 +250,23 @@ pub unsafe extern "C" fn upload_save_to_server(
     package_id: *const c_char,
     user_secret: *const c_char,
     file_or_folder_path: *const c_char,
-) -> *mut c_char {
-    if package_id.is_null() {
-        return string_to_c_char("Error: Missing package_id parameter".to_string());
-    }
-    if user_secret.is_null() {
-        return string_to_c_char("Error: Missing user_secret parameter".to_string());
-    }
-    if file_or_folder_path.is_null() {
-        return string_to_c_char("Error: Missing file_or_folder_path parameter".to_string());
-    }
-
-    let package_id = unsafe {
-        match CStr::from_ptr(package_id).to_str() {
-            Ok(s) if !s.is_empty() => s,
-            _ => return string_to_c_char("Error: Invalid package_id parameter".to_string()),
-        }
+) -> *mut DevstoreFfiMessage {
+    let package_id = match parse_c_string(package_id, "package_id") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
-    let user_secret = unsafe {
-        match CStr::from_ptr(user_secret).to_str() {
-            Ok(s) if !s.is_empty() => s,
-            _ => return string_to_c_char("Error: Invalid user_secret parameter".to_string()),
-        }
+    let user_secret = match parse_c_string(user_secret, "user_secret") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
-    let file_or_folder_path = unsafe {
-        match CStr::from_ptr(file_or_folder_path).to_str() {
-            Ok(s) if !s.is_empty() => s,
-            _ => {
-                return string_to_c_char(
-                    "Error: Invalid file_or_folder_path parameter".to_string(),
-                );
-            }
-        }
+    let file_or_folder_path = match parse_c_string(file_or_folder_path, "file_or_folder_path") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
     let path_check: Metadata = match fs::metadata(file_or_folder_path) {
         Ok(m) => m,
-        Err(_) => return string_to_c_char("Error: File or folder does not exist".to_string()),
+        Err(_) => return message_error("Error: File or folder does not exist"),
     };
 
     let mut zip_data: Vec<u8> = Vec::new();
@@ -172,17 +280,17 @@ pub unsafe extern "C" fn upload_save_to_server(
             println!("File found, adding to memory...");
             let file_bytes = match fs::read(file_or_folder_path) {
                 Ok(b) => b,
-                Err(_) => return string_to_c_char("Error: Failed to read file".to_string()),
+                Err(_) => return message_error("Error: Failed to read file"),
             };
             let filename = Path::new(file_or_folder_path)
                 .file_name()
                 .and_then(|s| s.to_str())
                 .unwrap_or("file");
             if let Err(e) = zip_writer.start_file(filename, options) {
-                return string_to_c_char(format!("Error: Failed to start zip file: {}", e));
+                return message_error(format!("Error: Failed to start zip file: {}", e));
             }
             if let Err(e) = zip_writer.write_all(&file_bytes) {
-                return string_to_c_char(format!("Error: Failed to write file data to zip: {}", e));
+                return message_error(format!("Error: Failed to write file data to zip: {}", e));
             }
         } else if path_check.is_dir() {
             println!("Folder found, zipping entire folder in memory...");
@@ -191,7 +299,7 @@ pub unsafe extern "C" fn upload_save_to_server(
                 let entry = match entry {
                     Ok(e) => e,
                     Err(e) => {
-                        return string_to_c_char(format!("Error: traversing directory: {}", e));
+                        return message_error(format!("Error: traversing directory: {}", e));
                     }
                 };
                 let path = entry.path();
@@ -199,16 +307,13 @@ pub unsafe extern "C" fn upload_save_to_server(
                     let relative_path = match path.strip_prefix(folder_path) {
                         Ok(p) => p,
                         Err(e) => {
-                            return string_to_c_char(format!(
-                                "Error: computing relative path: {}",
-                                e
-                            ));
+                            return message_error(format!("Error: computing relative path: {}", e));
                         }
                     };
                     let file_bytes = match fs::read(path) {
                         Ok(b) => b,
                         Err(e) => {
-                            return string_to_c_char(format!(
+                            return message_error(format!(
                                 "Error: Failed to read file in folder: {}",
                                 e
                             ));
@@ -216,13 +321,10 @@ pub unsafe extern "C" fn upload_save_to_server(
                     };
                     if let Err(e) = zip_writer.start_file(relative_path.to_string_lossy(), options)
                     {
-                        return string_to_c_char(format!(
-                            "Error: Failed to add file to zip: {}",
-                            e
-                        ));
+                        return message_error(format!("Error: Failed to add file to zip: {}", e));
                     }
                     if let Err(e) = zip_writer.write_all(&file_bytes) {
-                        return string_to_c_char(format!(
+                        return message_error(format!(
                             "Error: Failed to write file data to zip: {}",
                             e
                         ));
@@ -230,10 +332,10 @@ pub unsafe extern "C" fn upload_save_to_server(
                 }
             }
         } else {
-            return string_to_c_char("Error: Path is neither a file nor a directory".to_string());
+            return message_error("Error: Path is neither a file nor a directory");
         }
         if let Err(e) = zip_writer.finish() {
-            return string_to_c_char(format!("Error: Failed to finish zip archive: {}", e));
+            return message_error(format!("Error: Failed to finish zip archive: {}", e));
         }
     }
 
@@ -243,7 +345,7 @@ pub unsafe extern "C" fn upload_save_to_server(
     {
         Ok(p) => p,
         Err(e) => {
-            return string_to_c_char(format!("Error: Failed to create multipart part: {}", e));
+            return message_error(format!("Error: Failed to create multipart part: {}", e));
         }
     };
     let form = reqwest::blocking::multipart::Form::new()
@@ -253,7 +355,7 @@ pub unsafe extern "C" fn upload_save_to_server(
 
     let client = reqwest::blocking::Client::new();
     let resp = client
-        .post(format!("{}cloud-saves/", URL))
+        .post(format!("{}cloud-saves/", api_base_url()))
         .multipart(form)
         .send();
 
@@ -267,17 +369,15 @@ pub unsafe extern "C" fn upload_save_to_server(
                 let parsed: Result<Value, _> = serde_json::from_str(&text);
                 if let Ok(json) = parsed {
                     if let Some(msg) = json.get("message") {
-                        return string_to_c_char(format!("Upload successful: {}", msg));
+                        return message_success(format!("Upload successful: {}", msg));
                     }
                 }
-                return string_to_c_char(format!("Upload successful: {}", text));
+                return message_success(format!("Upload successful: {}", text));
             } else {
-                return string_to_c_char(format!("Upload failed: {}", text));
+                return message_error(format!("Upload failed: {}", text));
             }
         }
-        Err(e) => {
-            return string_to_c_char(format!("Error: {}", e));
-        }
+        Err(e) => message_error(format!("Error: {}", e)),
     }
 }
 
@@ -286,39 +386,23 @@ pub unsafe extern "C" fn download_save_from_server(
     package_id: *const c_char,
     user_secret: *const c_char,
     extract_path: *const c_char,
-) -> *mut c_char {
-    if package_id.is_null() {
-        return string_to_c_char("Error: Missing package_id parameter".to_string());
-    }
-    if user_secret.is_null() {
-        return string_to_c_char("Error: Missing user_secret parameter".to_string());
-    }
-    if extract_path.is_null() {
-        return string_to_c_char("Error: Missing extract_path parameter".to_string());
-    }
-
-    let package_id = unsafe {
-        match CStr::from_ptr(package_id).to_str() {
-            Ok(s) if !s.is_empty() => s,
-            _ => return string_to_c_char("Error: Invalid package_id parameter".to_string()),
-        }
+) -> *mut DevstoreFfiMessage {
+    let package_id = match parse_c_string(package_id, "package_id") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
-    let user_secret = unsafe {
-        match CStr::from_ptr(user_secret).to_str() {
-            Ok(s) if !s.is_empty() => s,
-            _ => return string_to_c_char("Error: Invalid user_secret parameter".to_string()),
-        }
+    let user_secret = match parse_c_string(user_secret, "user_secret") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
-    let extract_path = unsafe {
-        match CStr::from_ptr(extract_path).to_str() {
-            Ok(s) if !s.is_empty() => s,
-            _ => return string_to_c_char("Error: Invalid extract_path parameter".to_string()),
-        }
+    let extract_path = match parse_c_string(extract_path, "extract_path") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
     let client = reqwest::blocking::Client::new();
     let resp = client
-        .get(format!("{}cloud-saves/", URL))
+        .get(format!("{}cloud-saves/", api_base_url()))
         .query(&[("user_secret", user_secret), ("product_id", package_id)])
         .send();
 
@@ -328,7 +412,7 @@ pub unsafe extern "C" fn download_save_from_server(
                 let bytes = match response.bytes() {
                     Ok(b) => b,
                     Err(e) => {
-                        return string_to_c_char(format!(
+                        return message_error(format!(
                             "Error: Failed to read response bytes: {}",
                             e
                         ));
@@ -338,10 +422,7 @@ pub unsafe extern "C" fn download_save_from_server(
                 let mut zip_archive = match zip::ZipArchive::new(cursor) {
                     Ok(z) => z,
                     Err(e) => {
-                        return string_to_c_char(format!(
-                            "Error: Failed to open zip archive: {}",
-                            e
-                        ));
+                        return message_error(format!("Error: Failed to open zip archive: {}", e));
                     }
                 };
 
@@ -349,7 +430,7 @@ pub unsafe extern "C" fn download_save_from_server(
                     let mut file = match zip_archive.by_index(i) {
                         Ok(f) => f,
                         Err(e) => {
-                            return string_to_c_char(format!(
+                            return message_error(format!(
                                 "Error: Failed to access file in zip: {}",
                                 e
                             ));
@@ -358,7 +439,7 @@ pub unsafe extern "C" fn download_save_from_server(
                     let outpath = Path::new(extract_path).join(file.name());
                     if file.name().ends_with('/') {
                         if let Err(e) = fs::create_dir_all(&outpath) {
-                            return string_to_c_char(format!(
+                            return message_error(format!(
                                 "Error: Failed to create directory: {}",
                                 e
                             ));
@@ -367,7 +448,7 @@ pub unsafe extern "C" fn download_save_from_server(
                         if let Some(p) = outpath.parent() {
                             if !p.exists() {
                                 if let Err(e) = fs::create_dir_all(&p) {
-                                    return string_to_c_char(format!(
+                                    return message_error(format!(
                                         "Error: Failed to create parent directory: {}",
                                         e
                                     ));
@@ -377,50 +458,42 @@ pub unsafe extern "C" fn download_save_from_server(
                         let mut outfile = match fs::File::create(&outpath) {
                             Ok(f) => f,
                             Err(e) => {
-                                return string_to_c_char(format!(
+                                return message_error(format!(
                                     "Error: Failed to create output file: {}",
                                     e
                                 ));
                             }
                         };
                         if let Err(e) = io::copy(&mut file, &mut outfile) {
-                            return string_to_c_char(format!(
+                            return message_error(format!(
                                 "Error: Failed to copy file contents: {}",
                                 e
                             ));
                         }
                     }
                 }
-                return string_to_c_char("Download and extraction successful.".to_string());
+                return message_success("Download and extraction successful.");
             } else {
                 let text = response
                     .text()
                     .unwrap_or_else(|_| "No response message".to_string());
-                return string_to_c_char(format!("Download failed: {}", text));
+                return message_error(format!("Download failed: {}", text));
             }
         }
-        Err(e) => {
-            return string_to_c_char(format!("Error: {}", e));
-        }
+        Err(e) => message_error(format!("Error: {}", e)),
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn get_version_from_id(package_id: *const c_char) -> *mut c_char {
-    if package_id.is_null() {
-        return string_to_c_char("Error: Missing package_id parameter".to_string());
-    }
-
-    let package_id = unsafe {
-        match CStr::from_ptr(package_id).to_str() {
-            Ok(s) if !s.is_empty() => s,
-            _ => return string_to_c_char("Error: Invalid package_id parameter".to_string()),
-        }
+pub extern "C" fn get_version_from_id(package_id: *const c_char) -> *mut DevstoreFfiMessage {
+    let package_id = match parse_c_string(package_id, "package_id") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
     let client = reqwest::blocking::Client::new();
     let resp = client
-        .get(format!("{}version-hex/", URL))
+        .get(format!("{}version-hex/", api_base_url()))
         .query(&[("product_id", package_id)])
         .send();
 
@@ -433,56 +506,45 @@ pub extern "C" fn get_version_from_id(package_id: *const c_char) -> *mut c_char 
                 let parsed: Result<Value, _> = serde_json::from_str(&text);
                 if let Ok(json) = parsed {
                     if let Some(version) = json.get("version") {
-                        return string_to_c_char(version.to_string());
+                        return message_success(version.to_string());
                     }
                 }
-                return string_to_c_char(format!("Response: {}", text));
+                return message_info(format!("Response: {}", text));
             } else {
                 let text = response
                     .text()
                     .unwrap_or_else(|_| "No response message".to_string());
-                return string_to_c_char(format!("Request failed: {}", text));
+                return message_error(format!("Request failed: {}", text));
             }
         }
-        Err(e) => {
-            return string_to_c_char(format!("Request error: {}", e));
-        }
+        Err(e) => message_error(format!("Request error: {}", e)),
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn send_notification(title: *const c_char, body: *const c_char) -> *mut c_char {
-    if title.is_null() {
-        return string_to_c_char("Error: Missing title parameter".to_string());
-    }
-    if body.is_null() {
-        return string_to_c_char("Error: Missing body parameter".to_string());
-    }
-
-    let title = unsafe {
-        match CStr::from_ptr(title).to_str() {
-            Ok(s) if !s.is_empty() => s,
-            _ => return string_to_c_char("Error: Invalid title parameter".to_string()),
-        }
+pub extern "C" fn send_notification(
+    title: *const c_char,
+    body: *const c_char,
+) -> *mut DevstoreFfiMessage {
+    let title = match parse_c_string(title, "title") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
-
-    let body = unsafe {
-        match CStr::from_ptr(body).to_str() {
-            Ok(s) if !s.is_empty() => s,
-            _ => return string_to_c_char("Error: Invalid body parameter".to_string()),
-        }
+    let body = match parse_c_string(body, "body") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
     if !is_sdl_available() {
-        return string_to_c_char(
-            "Error: SDL2 is not available on this platform or the SDL2 library not found.".to_string(),
+        return message_error(
+            "Error: SDL2 is not available on this platform or the SDL2 library not found.",
         );
     }
 
     if !is_sdl_initialized() {
         match sdl2::init() {
             Ok(_) => {}
-            Err(e) => return string_to_c_char(format!("Error: SDL2 init failed: {}", e)),
+            Err(e) => return message_error(format!("Error: SDL2 init failed: {}", e)),
         };
     }
 
@@ -492,28 +554,25 @@ pub extern "C" fn send_notification(title: *const c_char, body: *const c_char) -
         body,
         None,
     ) {
-        Ok(_) => string_to_c_char(format!("Notification sent: {} - {}", title, body)),
-        Err(e) => string_to_c_char(format!("Error: SDL2 messagebox failed: {}", e)),
+        Ok(_) => message_success(format!("Notification sent: {} - {}", title, body)),
+        Err(e) => message_error(format!("Error: SDL2 messagebox failed: {}", e)),
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn check_and_show_notification(product_id: *const c_char) -> *mut c_char {
-    if product_id.is_null() {
-        return string_to_c_char("Error: Missing product_id parameter".to_string());
-    }
-
-    let product_id = unsafe {
-        match CStr::from_ptr(product_id).to_str() {
-            Ok(s) if !s.is_empty() => s,
-            _ => return string_to_c_char("Error: Invalid product_id parameter".to_string()),
-        }
+pub extern "C" fn check_and_show_notification(
+    product_id: *const c_char,
+) -> *mut DevstoreFfiMessage {
+    let product_id = match parse_c_string(product_id, "product_id") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
     let client = reqwest::blocking::Client::new();
     let url = format!(
         "{}get-latest-notification-for-app/?product_id={}",
-        URL, product_id
+        api_base_url(),
+        product_id
     );
 
     let resp = client.get(&url).send();
@@ -524,12 +583,15 @@ pub extern "C" fn check_and_show_notification(product_id: *const c_char) -> *mut
                 let text = match resp.text() {
                     Ok(t) => t,
                     Err(e) => {
-                        return string_to_c_char(format!("Error: Failed to read response text, {}", e));
+                        return message_error(format!(
+                            "Error: Failed to read response text, {}",
+                            e
+                        ));
                     }
                 };
                 let json: Value = match serde_json::from_str(&text) {
                     Ok(j) => j,
-                    Err(e) => return string_to_c_char(format!("Error: Failed to parse JSON, {}", e)),
+                    Err(e) => return message_error(format!("Error: Failed to parse JSON, {}", e)),
                 };
 
                 let notif_id = json
@@ -543,116 +605,93 @@ pub extern "C" fn check_and_show_notification(product_id: *const c_char) -> *mut
                 let message = json.get("message").and_then(|m| m.as_str()).unwrap_or("");
 
                 if message.is_empty() || notif_id == 0 {
-                    return string_to_c_char("No notification to show.".to_string());
+                    return message_info("No notification to show.");
                 }
 
                 let mut cache = load_notification_cache();
                 if cache.contains(&notif_id) {
-                    return string_to_c_char("Notification already shown.".to_string());
+                    return message_info("Notification already shown.");
                 }
 
                 let c_title = CString::new(title).unwrap();
                 let c_body = CString::new(message).unwrap();
 
-                let _ = send_notification(c_title.as_ptr(), c_body.as_ptr());
+                let notification_result = send_notification(c_title.as_ptr(), c_body.as_ptr());
+                drop_message(notification_result);
 
                 cache.insert(notif_id);
                 save_notification_cache(&cache);
 
-                return string_to_c_char("Notification shown.".to_string());
+                return message_success("Notification shown.");
             } else {
-                return string_to_c_char("No notification returned from server.".to_string());
+                return message_info("No notification returned from server.");
             }
         }
-        Err(e) => {
-            return string_to_c_char(format!("HTTP request failed: {}", e));
-        }
+        Err(e) => message_error(format!("HTTP request failed: {}", e)),
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn init_simple_loop(product_id: *const c_char) -> *mut c_char {
+pub extern "C" fn init_simple_loop(product_id: *const c_char) -> *mut DevstoreFfiMessage {
     //_local_state_path: *const c_char
     // simple loop, this will be expanded to a more complex loop as the SDK grows.
-    if product_id.is_null() {
-        return string_to_c_char("Error: Missing product_id parameter".to_string());
-    }
-
-    /*if local_state_path.is_null() {
-        return string_to_c_char("Error: Missing local_state_path parameter".to_string());
-    }
-
-    let local_state_path = unsafe {
-        match CStr::from_ptr(local_state_path).to_str() {
-            Ok(s) if !s.is_empty() => s,
-            _ => return string_to_c_char("Error: Invalid local_state_path parameter".to_string()),
-        }
+    let parsed_product_id = match parse_c_string(product_id, "product_id") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
-    unsafe { std::env::set_var("LOCAL_STATE_PATH", local_state_path) };*/
-
-    let c_str = unsafe { CStr::from_ptr(product_id) };
-    let id = match c_str.to_str() {
-        Ok(s) if !s.is_empty() => s.to_owned(),
-        _ => return string_to_c_char("Error: Invalid product_id parameter".to_string()),
-    };
+    let id = parsed_product_id.to_owned();
 
     std::thread::spawn(move || {
         loop {
             let c_id = CString::new(id.clone()).unwrap();
-            let _ = check_and_show_notification(c_id.as_ptr());
+            let message = check_and_show_notification(c_id.as_ptr());
+            drop_message(message);
             std::thread::sleep(std::time::Duration::from_secs(140));
         }
     });
 
-    string_to_c_char("Background notification loop started.".to_string())
+    message_success("Background notification loop started.")
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn free_c_string(s: *mut c_char) {
-    if s.is_null() {
-        return;
-    }
-    unsafe {
-        let _ = CString::from_raw(s);
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn is_devstore_online() -> *mut c_char {
+pub extern "C" fn is_devstore_online() -> *mut DevstoreFfiMessage {
     let client = reqwest::blocking::Client::new();
-    let req = client.get(format!("{}status-check", URL)).send();
+    let req = client.get(format!("{}status-check", api_base_url())).send();
     match req {
         Ok(response) => {
             let status = response.status();
-
+            let code = status.as_u16() as u32;
             match status.as_u16() {
-                200 => string_to_c_char("0".to_string()),
-                503 => string_to_c_char("1".to_string()),
-                _ => string_to_c_char("2".to_string()),
+                200 => {
+                    message_with_code(DevstoreMessageStatus::Success, code, "Devstore is online.")
+                }
+                503 => message_with_code(
+                    DevstoreMessageStatus::Warning,
+                    code,
+                    "Devstore is under maintenance.",
+                ),
+                other => message_with_code(
+                    DevstoreMessageStatus::Warning,
+                    other as u32,
+                    format!("Devstore returned status {}", other),
+                ),
             }
         }
-
-        Err(_) => string_to_c_char("2".to_string()),
+        Err(e) => message_error(format!("Network error: {}", e)),
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn get_current_username(user_secret: *const c_char) -> *mut c_char {
-    if user_secret.is_null() {
-        return string_to_c_char("Error: Missing user_secret parameter".to_string());
-    }
-
-    let user_secret = unsafe {
-        match CStr::from_ptr(user_secret).to_str() {
-            Ok(s) if !s.is_empty() => s,
-            _ => return string_to_c_char("Error: Invalid user_secret parameter".to_string()),
-        }
+pub extern "C" fn get_current_username(user_secret: *const c_char) -> *mut DevstoreFfiMessage {
+    let user_secret = match parse_c_string(user_secret, "user_secret") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
     let client = reqwest::blocking::Client::new();
     let resp = client
-        .post(format!("{}get-username-by-secret/", URL))
+        .post(format!("{}get-username-by-secret/", api_base_url()))
         .form(&[("user_secret", user_secret)])
         .send();
 
@@ -664,7 +703,7 @@ pub extern "C" fn get_current_username(user_secret: *const c_char) -> *mut c_cha
                 .unwrap_or_else(|_| "No response message".to_string());
 
             if !status.is_success() {
-                return string_to_c_char(format!(
+                return message_error(format!(
                     "Error: Request failed (status {}): {}",
                     status.as_u16(),
                     text
@@ -674,55 +713,51 @@ pub extern "C" fn get_current_username(user_secret: *const c_char) -> *mut c_cha
             let json: Value = match serde_json::from_str(&text) {
                 Ok(j) => j,
                 Err(e) => {
-                    return string_to_c_char(format!(
-                        "Error: Failed to parse response JSON: {}",
-                        e
-                    ));
+                    return message_error(format!("Error: Failed to parse response JSON: {}", e));
                 }
             };
 
             match json.get("status").and_then(Value::as_str) {
                 Some("success") => match json.get("username").and_then(Value::as_str) {
-                    Some(username) => string_to_c_char(username.to_string()),
-                    None => string_to_c_char("Error: Username missing in response".to_string()),
+                    Some(username) => message_success(username.to_string()),
+                    None => message_error("Error: Username missing in response"),
                 },
                 Some("error") => {
                     let msg = json
                         .get("message")
                         .and_then(Value::as_str)
                         .unwrap_or("Unknown error");
-                    string_to_c_char(format!("Error: Server error: {}", msg))
+                    message_error(format!("Error: Server error: {}", msg))
                 }
                 Some(other) => {
-                    string_to_c_char(format!("Error: Unexpected status in response: {}", other))
+                    message_error(format!("Error: Unexpected status in response: {}", other))
                 }
-                None => string_to_c_char("Error: Missing status in response".to_string()),
+                None => message_error("Error: Missing status in response"),
             }
         }
-        Err(e) => string_to_c_char(format!("Error: Network error: {}", e)),
+        Err(e) => message_error(format!("Error: Network error: {}", e)),
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn download_update_for_product(package_id: *const c_char) -> *mut c_char {
-    if package_id.is_null() {
-        return string_to_c_char("Error: Missing package_id parameter".to_string());
-    }
-    let package_id = match CStr::from_ptr(package_id).to_str() {
-        Ok(s) if !s.is_empty() => s,
-        _ => return string_to_c_char("Error: Invalid package_id parameter".to_string()),
+pub unsafe extern "C" fn download_update_for_product(
+    package_id: *const c_char,
+) -> *mut DevstoreFfiMessage {
+    let package_id = match parse_c_string(package_id, "package_id") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
     let client = reqwest::blocking::Client::new();
     let resp = client
-        .post(format!("{}get_latest_patch/", URL))
+        .post(format!("{}get_latest_patch/", api_base_url()))
         .form(&[("product_id", package_id)])
         .send();
 
     let response = match resp {
         Ok(r) => r,
         Err(e) => {
-            return string_to_c_char(format!("Error: Network error: {}", e));
+            return message_error(format!("Error: Network error: {}", e));
         }
     };
 
@@ -730,12 +765,12 @@ pub unsafe extern "C" fn download_update_for_product(package_id: *const c_char) 
         let txt = response
             .text()
             .unwrap_or_else(|_| "No response message".to_string());
-        return string_to_c_char(format!("Error: Request failed: {}", txt));
+        return message_error(format!("Error: Request failed: {}", txt));
     }
 
     let bytes = match response.bytes() {
         Ok(b) => b,
-        Err(e) => return string_to_c_char(format!("Error: Failed to read response bytes: {}", e)),
+        Err(e) => return message_error(format!("Error: Failed to read response bytes: {}", e)),
     };
 
     let pref_dir = get_pref_path();
@@ -755,41 +790,39 @@ pub unsafe extern "C" fn download_update_for_product(package_id: *const c_char) 
         base_update
     };
     if let Err(e) = fs::create_dir_all(&update_path) {
-        return string_to_c_char(format!("Error: Failed to create update dir: {}", e));
+        return message_error(format!("Error: Failed to create update dir: {}", e));
     }
 
     let cursor = io::Cursor::new(bytes);
     let mut zip_archive = match zip::ZipArchive::new(cursor) {
         Ok(z) => z,
-        Err(e) => return string_to_c_char(format!("Error: Failed to open zip archive: {}", e)),
+        Err(e) => return message_error(format!("Error: Failed to open zip archive: {}", e)),
     };
 
     for i in 0..zip_archive.len() {
         let mut file = match zip_archive.by_index(i) {
             Ok(f) => f,
             Err(e) => {
-                return string_to_c_char(format!("Error: Failed to access file in zip: {}", e));
+                return message_error(format!("Error: Failed to access file in zip: {}", e));
             }
         };
         let outpath = update_path.join(Path::new(file.name()));
         if file.name().ends_with('/') {
             if let Err(e) = fs::create_dir_all(&outpath) {
-                return string_to_c_char(format!("Error: Failed to create directory: {}", e));
+                return message_error(format!("Error: Failed to create directory: {}", e));
             }
         } else {
             if let Some(p) = outpath.parent() {
                 if !p.exists() && fs::create_dir_all(p).is_err() {
-                    return string_to_c_char(
-                        "Error: Failed to create parent directory".to_string(),
-                    );
+                    return message_error("Error: Failed to create parent directory");
                 }
             }
             let mut outfile = match fs::File::create(&outpath) {
                 Ok(f) => f,
-                Err(e) => return string_to_c_char(format!("Error: Failed to create file: {}", e)),
+                Err(e) => return message_error(format!("Error: Failed to create file: {}", e)),
             };
             if io::copy(&mut file, &mut outfile).is_err() {
-                return string_to_c_char("Error: Failed to write file contents".to_string());
+                return message_error("Error: Failed to write file contents");
             }
         }
     }
@@ -801,30 +834,26 @@ pub unsafe extern "C" fn download_update_for_product(package_id: *const c_char) 
         let _ = fs::write(curr_file, data);
     }
 
-    string_to_c_char("Update downloaded and extracted successfully.".to_string())
+    message_success("Update downloaded and extracted successfully.")
 }
 
-
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn verify_download_v2(package_id: *const c_char) -> *mut c_char {
-    if package_id.is_null() {
-        return string_to_c_char("Error: Missing package_id parameter".to_string());
-    }
-    let package_id = match CStr::from_ptr(package_id).to_str() {
-        Ok(s) if !s.is_empty() => s,
-        _ => return string_to_c_char("Error: Invalid package_id parameter".to_string()),
+pub unsafe extern "C" fn verify_download_v2(package_id: *const c_char) -> *mut DevstoreFfiMessage {
+    let package_id = match parse_c_string(package_id, "package_id") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
     let client = reqwest::blocking::Client::new();
     let resp = client
-        .post(format!("{}verify-download/", URL))
+        .post(format!("{}verify-download/", api_base_url()))
         .form(&[("product_id", package_id)])
         .send();
 
     let response = match resp {
         Ok(r) => r,
         Err(e) => {
-            return string_to_c_char(format!("Error: Network error: {}", e));
+            return message_error(format!("Error: Network error: {}", e));
         }
     };
     let txt = response
@@ -834,24 +863,27 @@ pub unsafe extern "C" fn verify_download_v2(package_id: *const c_char) -> *mut c
     let json: Value = match serde_json::from_str(&txt) {
         Ok(j) => j,
         Err(_) => {
-            return string_to_c_char(format!("Error: Invalid server response: {}", txt));
+            return message_error(format!("Error: Invalid server response: {}", txt));
         }
     };
 
     match json.get("status").and_then(Value::as_str) {
-        Some("success") => string_to_c_char("Download verified successfully.".to_string()),
+        Some("success") => message_success("Download verified successfully."),
         Some("error") => {
             let msg = json
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("Unknown error");
-            let _ = send_notification(
-                CString::new("Download Verification Failed").unwrap().as_ptr(),
+            let notification_result = send_notification(
+                CString::new("Download Verification Failed")
+                    .unwrap()
+                    .as_ptr(),
                 CString::new(msg).unwrap().as_ptr(),
             );
-            string_to_c_char(format!("Error: {}", msg))
+            drop_message(notification_result);
+            message_error(format!("Error: {}", msg))
         }
-        _ => string_to_c_char(format!("Error: Unexpected response: {}", txt)),
+        _ => message_error(format!("Error: Unexpected response: {}", txt)),
     }
 }
 // end of main functions

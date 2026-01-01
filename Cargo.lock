@@ -254,10 +254,11 @@ dependencies = [
 
 [[package]]
 name = "devstoreSDK"
-version = "0.4.3"
+version = "0.4.9"
 dependencies = [
  "dirs",
  "libloading",
+ "once_cell",
  "rand",
  "reqwest",
  "sdl2",
