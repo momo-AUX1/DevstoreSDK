@@ -122,6 +122,10 @@ pub extern "C" fn devstore_free_message(message: *mut DevstoreFfiMessage) {
 
 static API_URL: Lazy<RwLock<String>> =
     Lazy::new(|| RwLock::new("https://xbdev.store/api/".to_string()));
+static RUSTLS_PROVIDER_READY: Lazy<()> = Lazy::new(|| {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+});
+
 const DEVSTORE_INSTALL_TAG: &str = "devstore_install";
 
 fn normalize_url(url: &str) -> String {
@@ -134,6 +138,10 @@ fn normalize_url(url: &str) -> String {
 
 fn api_base_url() -> String {
     API_URL.read().unwrap().clone()
+}
+
+fn ensure_crypto_provider() {
+    Lazy::force(&RUSTLS_PROVIDER_READY);
 }
 
 #[derive(Serialize, Deserialize)]
@@ -251,6 +259,7 @@ fn save_notification_cache(cache: &HashSet<u32>) {
 }
 
 fn build_http_client() -> Result<reqwest::blocking::Client, String> {
+    ensure_crypto_provider();
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -618,6 +627,7 @@ fn send_presence_command(details: String) -> Result<String, String> {
 }
 
 fn start_discord_runtime(init_response: DiscordInitResponse) -> Result<(), String> {
+    ensure_crypto_provider();
     let connect_url = build_websocket_connect_url(&init_response.ws_url, &init_response.ws_token)?;
     let (mut socket, _) = connect(connect_url.as_str())
         .map_err(|e| format!("Failed to connect to Discord websocket: {}", e))?;
@@ -873,6 +883,7 @@ pub unsafe extern "C" fn upload_save_to_server(
         .text("product_id", package_id.to_string())
         .part("save_file", part);
 
+    ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .post(format!("{}cloud-saves/", api_base_url()))
@@ -920,6 +931,7 @@ pub unsafe extern "C" fn download_save_from_server(
         Err(err) => return err,
     };
 
+    ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get(format!("{}cloud-saves/", api_base_url()))
@@ -1011,6 +1023,7 @@ pub extern "C" fn get_version_from_id(package_id: *const c_char) -> *mut Devstor
         Err(err) => return err,
     };
 
+    ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get(format!("{}version-hex/", api_base_url()))
@@ -1088,6 +1101,7 @@ pub extern "C" fn check_and_show_notification(
         Err(err) => return err,
     };
 
+    ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let url = format!(
         "{}get-latest-notification-for-app/?product_id={}",
@@ -1176,6 +1190,7 @@ pub extern "C" fn init_simple_loop(product_id: *const c_char) -> *mut DevstoreFf
 
 #[unsafe(no_mangle)]
 pub extern "C" fn is_devstore_online() -> *mut DevstoreFfiMessage {
+    ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let req = client.get(format!("{}status-check", api_base_url())).send();
     match req {
@@ -1209,6 +1224,7 @@ pub extern "C" fn get_current_username(user_secret: *const c_char) -> *mut Devst
         Err(err) => return err,
     };
 
+    ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .post(format!("{}get-username-by-secret/", api_base_url()))
@@ -1268,6 +1284,7 @@ pub unsafe extern "C" fn download_update_for_product(
         Err(err) => return err,
     };
 
+    ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .post(format!("{}get_latest_patch/", api_base_url()))

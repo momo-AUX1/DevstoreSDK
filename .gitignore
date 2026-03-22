@@ -3,3 +3,4 @@
 src/lib_fulltrust.rs
 /include/*
 !/include/devstore_sdk.h
+python/
