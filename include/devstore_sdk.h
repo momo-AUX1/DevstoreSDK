@@ -1,9 +1,5 @@
-use std::env;
-use std::fs;
-use std::io;
-use std::path::Path;
-
-const HEADER_TEMPLATE: &str = r#"#ifndef DEVSTORE_SDK_H
+/* Auto-generated devstoreSDK header v0.4.9 */
+#ifndef DEVSTORE_SDK_H
 #define DEVSTORE_SDK_H
 
 #include <stdint.h>
@@ -50,20 +46,4 @@ void devstore_free_message(DevstoreFfiMessage* message);
 #endif
 
 #endif // DEVSTORE_SDK_H
-"#;
 
-fn main() -> io::Result<()> {
-    let version = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string());
-    let include_dir = Path::new("include");
-    fs::create_dir_all(include_dir)?;
-    let header_path = include_dir.join("devstore_sdk.h");
-    let contents = format!(
-        "/* Auto-generated devstoreSDK header v{} */\n{}\n",
-        version, HEADER_TEMPLATE
-    );
-    fs::write(&header_path, contents)?;
-    println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/lib.rs");
-    println!("cargo:rerun-if-changed=Cargo.toml");
-    Ok(())
-}

@@ -1,4 +1,5 @@
 /target
 .DS_Store
 src/lib_fulltrust.rs
-/include
+/include/*
+!/include/devstore_sdk.h

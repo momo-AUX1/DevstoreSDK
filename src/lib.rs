@@ -1,6 +1,6 @@
 use libloading::Library;
 use once_cell::sync::Lazy;
-use rand::{Rng, thread_rng};
+use rand::{Rng, rng};
 use reqwest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -8,11 +8,14 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::fs::{self, Metadata};
-use std::io::{self, Write};
+use std::io::{self, Cursor, Read, Seek, Write};
 use std::os::raw::c_char;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock, mpsc};
+use std::thread;
+use std::time::Duration;
+use tungstenite::{Message, connect};
 use walkdir::WalkDir;
 use zip;
 
@@ -119,6 +122,7 @@ pub extern "C" fn devstore_free_message(message: *mut DevstoreFfiMessage) {
 
 static API_URL: Lazy<RwLock<String>> =
     Lazy::new(|| RwLock::new("https://xbdev.store/api/".to_string()));
+const DEVSTORE_INSTALL_TAG: &str = "devstore_install";
 
 fn normalize_url(url: &str) -> String {
     if url.ends_with('/') {
@@ -136,6 +140,35 @@ fn api_base_url() -> String {
 struct NotificationCache {
     shown_ids: Vec<u32>,
 }
+
+#[derive(Clone, Debug, Deserialize)]
+struct DiscordInitResponse {
+    ws_url: String,
+    ws_token: String,
+    expires_in: u64,
+    username: String,
+    discord_uid: String,
+}
+
+enum DiscordCommand {
+    SetPresence {
+        details: String,
+        reply: mpsc::Sender<Result<String, String>>,
+    },
+    Quit {
+        reply: Option<mpsc::Sender<Result<String, String>>>,
+    },
+}
+
+struct DiscordRuntime {
+    sender: mpsc::Sender<DiscordCommand>,
+    handle: thread::JoinHandle<()>,
+}
+
+static DISCORD_RUNTIME: Lazy<Mutex<Option<DiscordRuntime>>> = Lazy::new(|| Mutex::new(None));
+
+const DISCORD_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const DISCORD_PING_INTERVAL: Duration = Duration::from_secs(15);
 
 // Helper functions that are internal to the library
 
@@ -217,6 +250,441 @@ fn save_notification_cache(cache: &HashSet<u32>) {
     }
 }
 
+fn build_http_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))
+}
+
+fn build_websocket_connect_url(ws_url: &str, ws_token: &str) -> Result<String, String> {
+    let mut parsed = reqwest::Url::parse(ws_url)
+        .map_err(|e| format!("Invalid websocket URL '{}': {}", ws_url, e))?;
+    parsed.query_pairs_mut().append_pair("token", ws_token);
+    Ok(parsed.to_string())
+}
+
+fn parse_json_response(text: &str) -> Result<Value, String> {
+    serde_json::from_str(text).map_err(|e| format!("Failed to parse JSON response: {}", e))
+}
+
+fn post_simple_verification(
+    endpoint: &str,
+    fields: &[(&str, &str)],
+    success_message: &str,
+    notification_title: &str,
+) -> *mut DevstoreFfiMessage {
+    let client = match build_http_client() {
+        Ok(client) => client,
+        Err(error) => return message_error(error),
+    };
+
+    let response = match client
+        .post(format!("{}{}", api_base_url(), endpoint))
+        .form(fields)
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) => return message_error(format!("Error: Network error: {}", error)),
+    };
+
+    let text = response
+        .text()
+        .unwrap_or_else(|_| "No response message".to_string());
+
+    let json = match parse_json_response(&text) {
+        Ok(json) => json,
+        Err(_) => return message_error(format!("Error: Invalid server response: {}", text)),
+    };
+
+    match json.get("status").and_then(Value::as_str) {
+        Some("success") => message_success(success_message),
+        Some("error") => {
+            let msg = json
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Unknown error");
+            let notification_result = send_notification(
+                CString::new(notification_title).unwrap().as_ptr(),
+                CString::new(msg).unwrap().as_ptr(),
+            );
+            drop_message(notification_result);
+            message_error(format!("Error: {}", msg))
+        }
+        _ => message_error(format!("Error: Unexpected response: {}", text)),
+    }
+}
+
+fn normalize_install_token(token: &str) -> Option<String> {
+    let trimmed = token.trim().to_ascii_lowercase();
+    if trimmed.len() != 96 || !trimmed.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some(trimmed)
+}
+
+fn extract_install_token_from_manifest_content(content: &str) -> Option<String> {
+    let document = roxmltree::Document::parse(content).ok()?;
+    for node in document.descendants() {
+        if node.tag_name().name() != DEVSTORE_INSTALL_TAG {
+            continue;
+        }
+        if let Some(text) = node.text() {
+            if let Some(token) = normalize_install_token(text) {
+                return Some(token);
+            }
+        }
+    }
+    None
+}
+
+fn extract_install_token_from_archive_reader<R>(reader: R) -> Result<Option<String>, String>
+where
+    R: Read + Seek,
+{
+    let mut archive = zip::ZipArchive::new(reader)
+        .map_err(|e| format!("Failed to open package archive: {}", e))?;
+
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|e| format!("Failed to inspect package archive: {}", e))?;
+        let file_name = file.name().to_ascii_lowercase();
+
+        if file_name.ends_with("appxmanifest.xml") {
+            let mut manifest = String::new();
+            file.read_to_string(&mut manifest)
+                .map_err(|e| format!("Failed to read manifest from package archive: {}", e))?;
+            if let Some(token) = extract_install_token_from_manifest_content(&manifest) {
+                return Ok(Some(token));
+            }
+            continue;
+        }
+
+        if file_name.ends_with(".appx")
+            || file_name.ends_with(".msix")
+            || file_name.ends_with(".appxbundle")
+            || file_name.ends_with(".msixbundle")
+            || file_name.ends_with(".zip")
+        {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|e| format!("Failed to read nested package archive: {}", e))?;
+            if let Some(token) = extract_install_token_from_archive_reader(Cursor::new(bytes))? {
+                return Ok(Some(token));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn extract_install_token_from_directory(path: &Path) -> Result<Option<String>, String> {
+    for entry in WalkDir::new(path) {
+        let entry = entry.map_err(|e| format!("Failed to inspect package directory: {}", e))?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("AppxManifest.xml")
+        {
+            let manifest = fs::read_to_string(entry.path())
+                .map_err(|e| format!("Failed to read package manifest: {}", e))?;
+            if let Some(token) = extract_install_token_from_manifest_content(&manifest) {
+                return Ok(Some(token));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn extract_install_token_from_path(path: &Path) -> Result<String, String> {
+    if !path.exists() {
+        return Err(format!("Package path does not exist: {}", path.display()));
+    }
+
+    if path.is_dir() {
+        return extract_install_token_from_directory(path)?.ok_or_else(|| {
+            "No DevStore install token found in the package directory.".to_string()
+        });
+    }
+
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case("AppxManifest.xml"))
+        .unwrap_or(false)
+    {
+        let manifest = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read package manifest: {}", e))?;
+        return extract_install_token_from_manifest_content(&manifest)
+            .ok_or_else(|| "No DevStore install token found in the package manifest.".to_string());
+    }
+
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !matches!(
+        extension.as_str(),
+        "appx" | "msix" | "appxbundle" | "msixbundle" | "zip"
+    ) {
+        return Err("Path must point to an AppxManifest.xml file, a package root directory, or an APPX/MSIX archive.".to_string());
+    }
+
+    let file = fs::File::open(path)
+        .map_err(|e| format!("Failed to open package path '{}': {}", path.display(), e))?;
+    extract_install_token_from_archive_reader(file)?
+        .ok_or_else(|| "No DevStore install token found in the package archive.".to_string())
+}
+
+fn read_socket_json<S>(socket: &mut tungstenite::WebSocket<S>) -> Result<Value, String>
+where
+    S: std::io::Read + std::io::Write,
+{
+    loop {
+        let message = socket
+            .read()
+            .map_err(|e| format!("WebSocket read failed: {}", e))?;
+        match message {
+            Message::Text(text) => {
+                return serde_json::from_str(text.as_ref())
+                    .map_err(|e| format!("Invalid websocket JSON: {}", e));
+            }
+            Message::Ping(payload) => {
+                socket
+                    .send(Message::Pong(payload))
+                    .map_err(|e| format!("Failed to answer websocket ping: {}", e))?;
+            }
+            Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
+            Message::Close(frame) => {
+                let description = frame
+                    .map(|item| item.reason.to_string())
+                    .unwrap_or_else(|| "server closed the websocket".to_string());
+                return Err(description);
+            }
+        }
+    }
+}
+
+fn expect_socket_message(
+    message: Value,
+    expected_type: &str,
+    expected_action: Option<&str>,
+) -> Result<String, String> {
+    let message_type = message
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "WebSocket response did not include a type.".to_string())?;
+
+    if message_type == "error" {
+        let error = message
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown websocket error.");
+        return Err(error.to_string());
+    }
+
+    if message_type != expected_type {
+        return Err(format!(
+            "Unexpected websocket response '{}', expected '{}'.",
+            message_type, expected_type
+        ));
+    }
+
+    if let Some(expected_action) = expected_action {
+        let action = message
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "WebSocket response did not include an action.".to_string())?;
+        if action != expected_action {
+            return Err(format!(
+                "Unexpected websocket action '{}', expected '{}'.",
+                action, expected_action
+            ));
+        }
+    }
+
+    Ok(message_type.to_string())
+}
+
+fn send_socket_command<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    payload: Value,
+    expected_type: &str,
+    expected_action: Option<&str>,
+) -> Result<String, String>
+where
+    S: std::io::Read + std::io::Write,
+{
+    socket
+        .send(Message::Text(payload.to_string().into()))
+        .map_err(|e| format!("WebSocket write failed: {}", e))?;
+    let response = read_socket_json(socket)?;
+    expect_socket_message(response, expected_type, expected_action)
+}
+
+fn request_discord_init(
+    secret_code: &str,
+    product_id: &str,
+) -> Result<DiscordInitResponse, String> {
+    let client = build_http_client()?;
+    let body = json!({
+        "secret_code": secret_code,
+        "product_id": product_id,
+    });
+
+    let response = client
+        .post(format!("{}discord/init/", api_base_url()))
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .send()
+        .map_err(|e| format!("Discord init request failed: {}", e))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .unwrap_or_else(|_| "No response body".to_string());
+
+    if !status.is_success() {
+        if let Ok(json) = parse_json_response(&text) {
+            let message = json
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Discord init failed.");
+            return Err(format!("Discord init failed: {}", message));
+        }
+        return Err(format!("Discord init failed: {}", text));
+    }
+
+    serde_json::from_str::<DiscordInitResponse>(&text)
+        .map_err(|e| format!("Failed to parse Discord init response: {}", e))
+}
+
+fn take_discord_runtime() -> Option<DiscordRuntime> {
+    DISCORD_RUNTIME.lock().unwrap().take()
+}
+
+fn store_discord_runtime(runtime: DiscordRuntime) {
+    *DISCORD_RUNTIME.lock().unwrap() = Some(runtime);
+}
+
+fn shutdown_discord_runtime() -> Result<String, String> {
+    let runtime = match take_discord_runtime() {
+        Some(runtime) => runtime,
+        None => return Ok("No active Discord session.".to_string()),
+    };
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let _ = runtime.sender.send(DiscordCommand::Quit {
+        reply: Some(reply_tx),
+    });
+
+    let close_result = match reply_rx.recv_timeout(DISCORD_COMMAND_TIMEOUT) {
+        Ok(result) => result,
+        Err(_) => Ok("Discord session closed.".to_string()),
+    };
+    let _ = runtime.handle.join();
+    close_result
+}
+
+fn send_presence_command(details: String) -> Result<String, String> {
+    let sender = {
+        let guard = DISCORD_RUNTIME.lock().unwrap();
+        match guard.as_ref() {
+            Some(runtime) => runtime.sender.clone(),
+            None => return Err("Discord session is not initialized.".to_string()),
+        }
+    };
+
+    let (reply_tx, reply_rx) = mpsc::channel();
+    let command = DiscordCommand::SetPresence {
+        details,
+        reply: reply_tx,
+    };
+
+    sender
+        .send(command)
+        .map_err(|_| "Discord session is not running.".to_string())?;
+
+    match reply_rx.recv_timeout(DISCORD_COMMAND_TIMEOUT) {
+        Ok(result) => result,
+        Err(_) => Err("Timed out waiting for Discord presence acknowledgement.".to_string()),
+    }
+}
+
+fn start_discord_runtime(init_response: DiscordInitResponse) -> Result<(), String> {
+    let connect_url = build_websocket_connect_url(&init_response.ws_url, &init_response.ws_token)?;
+    let (mut socket, _) = connect(connect_url.as_str())
+        .map_err(|e| format!("Failed to connect to Discord websocket: {}", e))?;
+
+    let ready = read_socket_json(&mut socket)?;
+    expect_socket_message(ready, "ready", None)?;
+
+    let (command_tx, command_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        loop {
+            match command_rx.recv_timeout(DISCORD_PING_INTERVAL) {
+                Ok(DiscordCommand::SetPresence { details, reply }) => {
+                    let result = send_socket_command(
+                        &mut socket,
+                        json!({
+                            "type": "set_presence",
+                            "details": details,
+                        }),
+                        "ack",
+                        Some("set_presence"),
+                    )
+                    .map(|_| "Presence updated.".to_string());
+                    let _ = reply.send(result);
+                }
+                Ok(DiscordCommand::Quit { reply }) => {
+                    let result = send_socket_command(
+                        &mut socket,
+                        json!({ "type": "quit" }),
+                        "ack",
+                        Some("quit"),
+                    )
+                    .map(|_| "Discord session closed.".to_string());
+                    if let Some(reply) = reply {
+                        let _ = reply.send(result);
+                    }
+                    let _ = socket.close(None);
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if send_socket_command(
+                        &mut socket,
+                        json!({ "type": "ping" }),
+                        "ack",
+                        Some("ping"),
+                    )
+                    .is_err()
+                    {
+                        let _ = socket.close(None);
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = socket.close(None);
+                    break;
+                }
+            }
+        }
+    });
+
+    store_discord_runtime(DiscordRuntime {
+        sender: command_tx,
+        handle,
+    });
+
+    Ok(())
+}
+
 // end of helper functions
 
 // Main functions that are exposed to C
@@ -243,6 +711,58 @@ pub extern "C" fn set_custom_url(custom_url: *const c_char) -> *mut DevstoreFfiM
     let mut guard = API_URL.write().unwrap();
     *guard = normalized.clone();
     message_success(format!("Custom URL set to {}", normalized))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn init_sdk_for_user(
+    product_id: *const c_char,
+    secret_code: *const c_char,
+) -> *mut DevstoreFfiMessage {
+    let product_id = match parse_c_string(product_id, "product_id") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let secret_code = match parse_c_string(secret_code, "secret_code") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    let _ = shutdown_discord_runtime();
+
+    let init_response = match request_discord_init(secret_code, product_id) {
+        Ok(response) => response,
+        Err(err) => return message_error(err),
+    };
+
+    if let Err(err) = start_discord_runtime(init_response.clone()) {
+        return message_error(err);
+    }
+
+    message_success(format!(
+        "Discord session ready for {} (expires in {}s, discord uid {}).",
+        init_response.username, init_response.expires_in, init_response.discord_uid
+    ))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn set_presence_for_user(details: *const c_char) -> *mut DevstoreFfiMessage {
+    let details = match parse_c_string(details, "details") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    match send_presence_command(details.to_string()) {
+        Ok(message) => message_success(message),
+        Err(err) => message_error(err),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn discord_quit() -> *mut DevstoreFfiMessage {
+    match shutdown_discord_runtime() {
+        Ok(message) => message_success(message),
+        Err(err) => message_error(err),
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -776,10 +1296,10 @@ pub unsafe extern "C" fn download_update_for_product(
     let pref_dir = get_pref_path();
     let base_update = pref_dir.join("update");
     let update_path = if base_update.exists() {
-        let mut rng = thread_rng();
+        let mut rng = rng();
         loop {
             let suffix: String = (0..3)
-                .map(|_| ((b'a' + rng.gen_range(0..26)) as char))
+                .map(|_| (b'a' + rng.random_range(0..26)) as char)
                 .collect();
             let candidate = pref_dir.join(format!("update_{}", suffix));
             if !candidate.exists() {
@@ -844,46 +1364,224 @@ pub unsafe extern "C" fn verify_download_v2(package_id: *const c_char) -> *mut D
         Err(err) => return err,
     };
 
-    let client = reqwest::blocking::Client::new();
-    let resp = client
-        .post(format!("{}verify-download/", api_base_url()))
-        .form(&[("product_id", package_id)])
-        .send();
+    post_simple_verification(
+        "drm/verify-ip/",
+        &[("product_id", package_id)],
+        "Download verified successfully.",
+        "Download Verification Failed",
+    )
+}
 
-    let response = match resp {
-        Ok(r) => r,
-        Err(e) => {
-            return message_error(format!("Error: Network error: {}", e));
-        }
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn verify_download_code(
+    product_id: *const c_char,
+    code: *const c_char,
+) -> *mut DevstoreFfiMessage {
+    let product_id = match parse_c_string(product_id, "product_id") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
-    let txt = response
-        .text()
-        .unwrap_or_else(|_| "No response message".to_string());
-
-    let json: Value = match serde_json::from_str(&txt) {
-        Ok(j) => j,
-        Err(_) => {
-            return message_error(format!("Error: Invalid server response: {}", txt));
-        }
+    let code = match parse_c_string(code, "code") {
+        Ok(value) => value,
+        Err(err) => return err,
     };
 
-    match json.get("status").and_then(Value::as_str) {
-        Some("success") => message_success("Download verified successfully."),
-        Some("error") => {
-            let msg = json
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("Unknown error");
-            let notification_result = send_notification(
-                CString::new("Download Verification Failed")
-                    .unwrap()
-                    .as_ptr(),
-                CString::new(msg).unwrap().as_ptr(),
-            );
-            drop_message(notification_result);
-            message_error(format!("Error: {}", msg))
-        }
-        _ => message_error(format!("Error: Unexpected response: {}", txt)),
-    }
+    post_simple_verification(
+        "drm/activate-download-code/",
+        &[("product_id", product_id), ("code", code)],
+        "Download activation code accepted.",
+        "Download Activation Failed",
+    )
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn verify_resigned_install_token(
+    product_id: *const c_char,
+    install_token: *const c_char,
+) -> *mut DevstoreFfiMessage {
+    let product_id = match parse_c_string(product_id, "product_id") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let install_token = match parse_c_string(install_token, "install_token") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    post_simple_verification(
+        "drm/verify-install-token/",
+        &[("product_id", product_id), ("install_token", install_token)],
+        "DevStore install token verified.",
+        "DevStore Install Verification Failed",
+    )
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn verify_resigned_package_path(
+    product_id: *const c_char,
+    package_or_root_path: *const c_char,
+) -> *mut DevstoreFfiMessage {
+    let product_id = match parse_c_string(product_id, "product_id") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+    let package_or_root_path = match parse_c_string(package_or_root_path, "package_or_root_path") {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
+
+    let install_token = match extract_install_token_from_path(Path::new(package_or_root_path)) {
+        Ok(token) => token,
+        Err(error) => return message_error(error),
+    };
+
+    post_simple_verification(
+        "drm/verify-install-token/",
+        &[
+            ("product_id", product_id),
+            ("install_token", install_token.as_str()),
+        ],
+        "DevStore install token verified.",
+        "DevStore Install Verification Failed",
+    )
 }
 // end of main functions
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn test_manifest(token: &str) -> String {
+        format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+         xmlns:uap3="http://schemas.microsoft.com/appx/manifest/uap/windows10/3"
+         IgnorableNamespaces="uap3">
+  <Applications>
+    <Application Id="App" Executable="App.exe" EntryPoint="App.Main">
+      <Extensions>
+        <uap3:Extension Category="windows.appExtension">
+          <uap3:AppExtension Name="xbdev.store.install" Id="devstoreinstall" PublicFolder="Public">
+            <uap3:Properties>
+              <devstore_install>{}</devstore_install>
+            </uap3:Properties>
+          </uap3:AppExtension>
+        </uap3:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>"#,
+            token
+        )
+    }
+
+    fn test_zip(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut cursor = Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for (name, bytes) in entries {
+                writer.start_file(name, options).unwrap();
+                writer.write_all(bytes).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("{}_{}", name, stamp));
+        path
+    }
+
+    #[test]
+    fn normalize_url_appends_trailing_slash() {
+        assert_eq!(
+            normalize_url("https://xbdev.store/api"),
+            "https://xbdev.store/api/"
+        );
+        assert_eq!(
+            normalize_url("https://xbdev.store/api/"),
+            "https://xbdev.store/api/"
+        );
+    }
+
+    #[test]
+    fn websocket_url_contains_signed_token_query() {
+        let url = build_websocket_connect_url("wss://xbdev.store/ws/discord-presence/", "abc123")
+            .expect("url should build");
+        assert!(url.contains("token=abc123"));
+    }
+
+    #[test]
+    fn websocket_error_message_is_extracted() {
+        let response = json!({
+            "type": "error",
+            "message": "bad token",
+        });
+        let error = expect_socket_message(response, "ack", Some("ping"))
+            .expect_err("error response should fail");
+        assert!(error.contains("bad token"));
+    }
+
+    #[test]
+    fn extract_install_token_from_manifest_content_works() {
+        let token = "a".repeat(96);
+        let manifest = test_manifest(&token);
+        assert_eq!(
+            extract_install_token_from_manifest_content(&manifest),
+            Some(token)
+        );
+    }
+
+    #[test]
+    fn extract_install_token_from_direct_package_archive_works() {
+        let token = "b".repeat(96);
+        let package = test_zip(&[("AppxManifest.xml", test_manifest(&token).into_bytes())]);
+        let extracted = extract_install_token_from_archive_reader(Cursor::new(package))
+            .expect("package should parse");
+        assert_eq!(extracted, Some(token));
+    }
+
+    #[test]
+    fn extract_install_token_from_zip_wrapped_package_works() {
+        let token = "c".repeat(96);
+        let package = test_zip(&[("AppxManifest.xml", test_manifest(&token).into_bytes())]);
+        let outer_zip = test_zip(&[("nested/app.msix", package)]);
+        let extracted = extract_install_token_from_archive_reader(Cursor::new(outer_zip))
+            .expect("nested archive should parse");
+        assert_eq!(extracted, Some(token));
+    }
+
+    #[test]
+    fn extract_install_token_from_directory_path_works() {
+        let token = "d".repeat(96);
+        let root = temp_path("devstore_sdk_manifest");
+        fs::create_dir_all(&root).unwrap();
+        let manifest_path = root.join("AppxManifest.xml");
+        fs::write(&manifest_path, test_manifest(&token)).unwrap();
+
+        let extracted = extract_install_token_from_path(&root).expect("directory should parse");
+        assert_eq!(extracted, token);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn committed_header_contains_new_exports() {
+        let header = include_str!("../include/devstore_sdk.h");
+        assert!(header.contains("init_sdk_for_user"));
+        assert!(header.contains("set_presence_for_user"));
+        assert!(header.contains("discord_quit"));
+        assert!(header.contains("verify_download_code"));
+        assert!(header.contains("verify_resigned_install_token"));
+        assert!(header.contains("verify_resigned_package_path"));
+    }
+}
