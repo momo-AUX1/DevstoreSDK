@@ -38,6 +38,7 @@ DevstoreFfiMessage* verify_resigned_install_token(const char* product_id, const 
 DevstoreFfiMessage* verify_resigned_package_path(const char* product_id, const char* package_or_root_path);
 DevstoreFfiMessage* init_sdk_for_user(const char* product_id, const char* secret_code);
 DevstoreFfiMessage* set_presence_for_user(const char* details);
+DevstoreFfiMessage* discord_heartbeat(void);
 DevstoreFfiMessage* discord_quit(void);
 void devstore_free_message(DevstoreFfiMessage* message);
 

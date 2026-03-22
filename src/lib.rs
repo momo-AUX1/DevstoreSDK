@@ -5,17 +5,17 @@ use reqwest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json::json;
+use std::any::Any;
 use std::collections::HashSet;
+use std::error::Error as StdError;
 use std::ffi::{CStr, CString};
 use std::fs::{self, Metadata};
 use std::io::{self, Cursor, Read, Seek, Write};
 use std::os::raw::c_char;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::{Mutex, RwLock, mpsc};
-use std::thread;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
-use tungstenite::{Message, connect};
 use walkdir::WalkDir;
 use zip;
 
@@ -115,9 +115,34 @@ fn drop_message(ptr: *mut DevstoreFfiMessage) {
     }
 }
 
+fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
+    if let Some(text) = payload.downcast_ref::<&'static str>() {
+        (*text).to_string()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+fn ffi_boundary<F>(operation: F) -> *mut DevstoreFfiMessage
+where
+    F: FnOnce() -> *mut DevstoreFfiMessage,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+        Ok(message) => message,
+        Err(payload) => message_error(format!(
+            "Internal SDK panic: {}",
+            panic_payload_to_string(payload)
+        )),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn devstore_free_message(message: *mut DevstoreFfiMessage) {
-    drop_message(message);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        drop_message(message);
+    }));
 }
 
 static API_URL: Lazy<RwLock<String>> =
@@ -144,6 +169,16 @@ fn ensure_crypto_provider() {
     Lazy::force(&RUSTLS_PROVIDER_READY);
 }
 
+fn format_error_chain(error: &dyn StdError) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut current = error.source();
+    while let Some(source) = current {
+        parts.push(source.to_string());
+        current = source.source();
+    }
+    parts.join(" -> ")
+}
+
 #[derive(Serialize, Deserialize)]
 struct NotificationCache {
     shown_ids: Vec<u32>,
@@ -151,32 +186,26 @@ struct NotificationCache {
 
 #[derive(Clone, Debug, Deserialize)]
 struct DiscordInitResponse {
-    ws_url: String,
-    ws_token: String,
+    session_token: String,
     expires_in: u64,
+    heartbeat_interval: u64,
     username: String,
     discord_uid: String,
 }
 
-enum DiscordCommand {
-    SetPresence {
-        details: String,
-        reply: mpsc::Sender<Result<String, String>>,
-    },
-    Quit {
-        reply: Option<mpsc::Sender<Result<String, String>>>,
-    },
+#[derive(Clone, Debug)]
+struct DiscordSessionState {
+    session_token: String,
+    expires_in: u64,
+    heartbeat_interval: u64,
+    username: String,
+    discord_uid: String,
 }
 
-struct DiscordRuntime {
-    sender: mpsc::Sender<DiscordCommand>,
-    handle: thread::JoinHandle<()>,
-}
+static DISCORD_SESSION: Lazy<Mutex<Option<DiscordSessionState>>> = Lazy::new(|| Mutex::new(None));
 
-static DISCORD_RUNTIME: Lazy<Mutex<Option<DiscordRuntime>>> = Lazy::new(|| Mutex::new(None));
-
-const DISCORD_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
-const DISCORD_PING_INTERVAL: Duration = Duration::from_secs(15);
+const DISCORD_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DISCORD_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
 // Helper functions that are internal to the library
 
@@ -261,16 +290,11 @@ fn save_notification_cache(cache: &HashSet<u32>) {
 fn build_http_client() -> Result<reqwest::blocking::Client, String> {
     ensure_crypto_provider();
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .use_rustls_tls()
+        .connect_timeout(DISCORD_CONNECT_TIMEOUT)
+        .timeout(DISCORD_REQUEST_TIMEOUT)
         .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))
-}
-
-fn build_websocket_connect_url(ws_url: &str, ws_token: &str) -> Result<String, String> {
-    let mut parsed = reqwest::Url::parse(ws_url)
-        .map_err(|e| format!("Invalid websocket URL '{}': {}", ws_url, e))?;
-    parsed.query_pairs_mut().append_pair("token", ws_token);
-    Ok(parsed.to_string())
+        .map_err(|e| format!("Failed to build HTTP client: {}", format_error_chain(&e)))
 }
 
 fn parse_json_response(text: &str) -> Result<Value, String> {
@@ -451,92 +475,6 @@ fn extract_install_token_from_path(path: &Path) -> Result<String, String> {
         .ok_or_else(|| "No DevStore install token found in the package archive.".to_string())
 }
 
-fn read_socket_json<S>(socket: &mut tungstenite::WebSocket<S>) -> Result<Value, String>
-where
-    S: std::io::Read + std::io::Write,
-{
-    loop {
-        let message = socket
-            .read()
-            .map_err(|e| format!("WebSocket read failed: {}", e))?;
-        match message {
-            Message::Text(text) => {
-                return serde_json::from_str(text.as_ref())
-                    .map_err(|e| format!("Invalid websocket JSON: {}", e));
-            }
-            Message::Ping(payload) => {
-                socket
-                    .send(Message::Pong(payload))
-                    .map_err(|e| format!("Failed to answer websocket ping: {}", e))?;
-            }
-            Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
-            Message::Close(frame) => {
-                let description = frame
-                    .map(|item| item.reason.to_string())
-                    .unwrap_or_else(|| "server closed the websocket".to_string());
-                return Err(description);
-            }
-        }
-    }
-}
-
-fn expect_socket_message(
-    message: Value,
-    expected_type: &str,
-    expected_action: Option<&str>,
-) -> Result<String, String> {
-    let message_type = message
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "WebSocket response did not include a type.".to_string())?;
-
-    if message_type == "error" {
-        let error = message
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("Unknown websocket error.");
-        return Err(error.to_string());
-    }
-
-    if message_type != expected_type {
-        return Err(format!(
-            "Unexpected websocket response '{}', expected '{}'.",
-            message_type, expected_type
-        ));
-    }
-
-    if let Some(expected_action) = expected_action {
-        let action = message
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "WebSocket response did not include an action.".to_string())?;
-        if action != expected_action {
-            return Err(format!(
-                "Unexpected websocket action '{}', expected '{}'.",
-                action, expected_action
-            ));
-        }
-    }
-
-    Ok(message_type.to_string())
-}
-
-fn send_socket_command<S>(
-    socket: &mut tungstenite::WebSocket<S>,
-    payload: Value,
-    expected_type: &str,
-    expected_action: Option<&str>,
-) -> Result<String, String>
-where
-    S: std::io::Read + std::io::Write,
-{
-    socket
-        .send(Message::Text(payload.to_string().into()))
-        .map_err(|e| format!("WebSocket write failed: {}", e))?;
-    let response = read_socket_json(socket)?;
-    expect_socket_message(response, expected_type, expected_action)
-}
-
 fn request_discord_init(
     secret_code: &str,
     product_id: &str,
@@ -552,7 +490,7 @@ fn request_discord_init(
         .header("Content-Type", "application/json")
         .body(body.to_string())
         .send()
-        .map_err(|e| format!("Discord init request failed: {}", e))?;
+        .map_err(|e| format!("Discord init request failed: {}", format_error_chain(&e)))?;
 
     let status = response.status();
     let text = response
@@ -574,125 +512,92 @@ fn request_discord_init(
         .map_err(|e| format!("Failed to parse Discord init response: {}", e))
 }
 
-fn take_discord_runtime() -> Option<DiscordRuntime> {
-    DISCORD_RUNTIME.lock().unwrap().take()
+fn current_discord_session() -> Option<DiscordSessionState> {
+    DISCORD_SESSION.lock().unwrap().clone()
 }
 
-fn store_discord_runtime(runtime: DiscordRuntime) {
-    *DISCORD_RUNTIME.lock().unwrap() = Some(runtime);
+fn store_discord_session(init_response: DiscordInitResponse) {
+    *DISCORD_SESSION.lock().unwrap() = Some(DiscordSessionState {
+        session_token: init_response.session_token,
+        expires_in: init_response.expires_in,
+        heartbeat_interval: init_response.heartbeat_interval,
+        username: init_response.username,
+        discord_uid: init_response.discord_uid,
+    });
+}
+
+fn take_discord_session() -> Option<DiscordSessionState> {
+    DISCORD_SESSION.lock().unwrap().take()
+}
+
+fn post_discord_presence_command(
+    session_token: &str,
+    endpoint: &str,
+    body: Option<Value>,
+) -> Result<String, String> {
+    let client = build_http_client()?;
+    let url = format!("{}{}", api_base_url(), endpoint);
+    let mut request = client
+        .post(url)
+        .header("Authorization", format!("Bearer {}", session_token))
+        .header("Content-Type", "application/json");
+
+    if let Some(body) = body {
+        request = request.body(body.to_string());
+    } else {
+        request = request.body("{}".to_string());
+    }
+
+    let response = request
+        .send()
+        .map_err(|e| format!("Discord request failed: {}", format_error_chain(&e)))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .unwrap_or_else(|_| "No response body".to_string());
+
+    let json = parse_json_response(&text)
+        .map_err(|_| format!("Discord request returned invalid JSON: {}", text))?;
+
+    if !status.is_success() {
+        let message = json
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Discord request failed.");
+        return Err(message.to_string());
+    }
+
+    Ok(json
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("Discord request completed.")
+        .to_string())
 }
 
 fn shutdown_discord_runtime() -> Result<String, String> {
-    let runtime = match take_discord_runtime() {
-        Some(runtime) => runtime,
+    let session = match take_discord_session() {
+        Some(session) => session,
         None => return Ok("No active Discord session.".to_string()),
     };
 
-    let (reply_tx, reply_rx) = mpsc::channel();
-    let _ = runtime.sender.send(DiscordCommand::Quit {
-        reply: Some(reply_tx),
-    });
-
-    let close_result = match reply_rx.recv_timeout(DISCORD_COMMAND_TIMEOUT) {
-        Ok(result) => result,
-        Err(_) => Ok("Discord session closed.".to_string()),
-    };
-    let _ = runtime.handle.join();
-    close_result
+    post_discord_presence_command(&session.session_token, "discord/presence/quit/", None)
 }
 
 fn send_presence_command(details: String) -> Result<String, String> {
-    let sender = {
-        let guard = DISCORD_RUNTIME.lock().unwrap();
-        match guard.as_ref() {
-            Some(runtime) => runtime.sender.clone(),
-            None => return Err("Discord session is not initialized.".to_string()),
-        }
-    };
-
-    let (reply_tx, reply_rx) = mpsc::channel();
-    let command = DiscordCommand::SetPresence {
-        details,
-        reply: reply_tx,
-    };
-
-    sender
-        .send(command)
-        .map_err(|_| "Discord session is not running.".to_string())?;
-
-    match reply_rx.recv_timeout(DISCORD_COMMAND_TIMEOUT) {
-        Ok(result) => result,
-        Err(_) => Err("Timed out waiting for Discord presence acknowledgement.".to_string()),
-    }
+    let session = current_discord_session()
+        .ok_or_else(|| "Discord session is not initialized.".to_string())?;
+    post_discord_presence_command(
+        &session.session_token,
+        "discord/presence/update/",
+        Some(json!({ "details": details })),
+    )
 }
 
-fn start_discord_runtime(init_response: DiscordInitResponse) -> Result<(), String> {
-    ensure_crypto_provider();
-    let connect_url = build_websocket_connect_url(&init_response.ws_url, &init_response.ws_token)?;
-    let (mut socket, _) = connect(connect_url.as_str())
-        .map_err(|e| format!("Failed to connect to Discord websocket: {}", e))?;
-
-    let ready = read_socket_json(&mut socket)?;
-    expect_socket_message(ready, "ready", None)?;
-
-    let (command_tx, command_rx) = mpsc::channel();
-    let handle = thread::spawn(move || {
-        loop {
-            match command_rx.recv_timeout(DISCORD_PING_INTERVAL) {
-                Ok(DiscordCommand::SetPresence { details, reply }) => {
-                    let result = send_socket_command(
-                        &mut socket,
-                        json!({
-                            "type": "set_presence",
-                            "details": details,
-                        }),
-                        "ack",
-                        Some("set_presence"),
-                    )
-                    .map(|_| "Presence updated.".to_string());
-                    let _ = reply.send(result);
-                }
-                Ok(DiscordCommand::Quit { reply }) => {
-                    let result = send_socket_command(
-                        &mut socket,
-                        json!({ "type": "quit" }),
-                        "ack",
-                        Some("quit"),
-                    )
-                    .map(|_| "Discord session closed.".to_string());
-                    if let Some(reply) = reply {
-                        let _ = reply.send(result);
-                    }
-                    let _ = socket.close(None);
-                    break;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if send_socket_command(
-                        &mut socket,
-                        json!({ "type": "ping" }),
-                        "ack",
-                        Some("ping"),
-                    )
-                    .is_err()
-                    {
-                        let _ = socket.close(None);
-                        break;
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    let _ = socket.close(None);
-                    break;
-                }
-            }
-        }
-    });
-
-    store_discord_runtime(DiscordRuntime {
-        sender: command_tx,
-        handle,
-    });
-
-    Ok(())
+fn send_heartbeat_command() -> Result<String, String> {
+    let session = current_discord_session()
+        .ok_or_else(|| "Discord session is not initialized.".to_string())?;
+    post_discord_presence_command(&session.session_token, "discord/presence/heartbeat/", None)
 }
 
 // end of helper functions
@@ -701,26 +606,30 @@ fn start_discord_runtime(init_response: DiscordInitResponse) -> Result<(), Strin
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_sdk_version() -> *mut DevstoreFfiMessage {
-    const RAW_TOML: &str = include_str!("../Cargo.toml");
-    let toml: Value = toml::from_str(RAW_TOML).unwrap();
-    let version = toml
-        .get("package")
-        .and_then(|p| p.get("version"))
-        .and_then(Value::as_str)
-        .unwrap_or("Unknown version");
-    message_success(version.to_string())
+    ffi_boundary(|| {
+        const RAW_TOML: &str = include_str!("../Cargo.toml");
+        let toml: Value = toml::from_str(RAW_TOML).unwrap();
+        let version = toml
+            .get("package")
+            .and_then(|p| p.get("version"))
+            .and_then(Value::as_str)
+            .unwrap_or("Unknown version");
+        message_success(version.to_string())
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn set_custom_url(custom_url: *const c_char) -> *mut DevstoreFfiMessage {
-    let parsed_url = match parse_c_string(custom_url, "custom_url") {
-        Ok(value) => value,
-        Err(err) => return err,
-    };
-    let normalized = normalize_url(parsed_url);
-    let mut guard = API_URL.write().unwrap();
-    *guard = normalized.clone();
-    message_success(format!("Custom URL set to {}", normalized))
+    ffi_boundary(|| {
+        let parsed_url = match parse_c_string(custom_url, "custom_url") {
+            Ok(value) => value,
+            Err(err) => return err,
+        };
+        let normalized = normalize_url(parsed_url);
+        let mut guard = API_URL.write().unwrap();
+        *guard = normalized.clone();
+        message_success(format!("Custom URL set to {}", normalized))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -728,51 +637,65 @@ pub extern "C" fn init_sdk_for_user(
     product_id: *const c_char,
     secret_code: *const c_char,
 ) -> *mut DevstoreFfiMessage {
-    let product_id = match parse_c_string(product_id, "product_id") {
-        Ok(value) => value,
-        Err(err) => return err,
-    };
-    let secret_code = match parse_c_string(secret_code, "secret_code") {
-        Ok(value) => value,
-        Err(err) => return err,
-    };
+    ffi_boundary(|| {
+        let product_id = match parse_c_string(product_id, "product_id") {
+            Ok(value) => value,
+            Err(err) => return err,
+        };
+        let secret_code = match parse_c_string(secret_code, "secret_code") {
+            Ok(value) => value,
+            Err(err) => return err,
+        };
 
-    let _ = shutdown_discord_runtime();
+        let _ = shutdown_discord_runtime();
 
-    let init_response = match request_discord_init(secret_code, product_id) {
-        Ok(response) => response,
-        Err(err) => return message_error(err),
-    };
+        let init_response = match request_discord_init(secret_code, product_id) {
+            Ok(response) => response,
+            Err(err) => return message_error(err),
+        };
 
-    if let Err(err) = start_discord_runtime(init_response.clone()) {
-        return message_error(err);
-    }
+        let username = init_response.username.clone();
+        let expires_in = init_response.expires_in;
+        let discord_uid = init_response.discord_uid.clone();
+        let heartbeat_interval = init_response.heartbeat_interval;
+        store_discord_session(init_response);
 
-    message_success(format!(
-        "Discord session ready for {} (expires in {}s, discord uid {}).",
-        init_response.username, init_response.expires_in, init_response.discord_uid
-    ))
+        message_success(format!(
+            "Discord session ready for {} (expires in {}s, heartbeat {}s, discord uid {}).",
+            username, expires_in, heartbeat_interval, discord_uid
+        ))
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn set_presence_for_user(details: *const c_char) -> *mut DevstoreFfiMessage {
-    let details = match parse_c_string(details, "details") {
-        Ok(value) => value,
-        Err(err) => return err,
-    };
+    ffi_boundary(|| {
+        let details = match parse_c_string(details, "details") {
+            Ok(value) => value,
+            Err(err) => return err,
+        };
 
-    match send_presence_command(details.to_string()) {
+        match send_presence_command(details.to_string()) {
+            Ok(message) => message_success(message),
+            Err(err) => message_error(err),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn discord_heartbeat() -> *mut DevstoreFfiMessage {
+    ffi_boundary(|| match send_heartbeat_command() {
         Ok(message) => message_success(message),
         Err(err) => message_error(err),
-    }
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn discord_quit() -> *mut DevstoreFfiMessage {
-    match shutdown_discord_runtime() {
+    ffi_boundary(|| match shutdown_discord_runtime() {
         Ok(message) => message_success(message),
         Err(err) => message_error(err),
-    }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1531,24 +1454,6 @@ mod tests {
     }
 
     #[test]
-    fn websocket_url_contains_signed_token_query() {
-        let url = build_websocket_connect_url("wss://xbdev.store/ws/discord-presence/", "abc123")
-            .expect("url should build");
-        assert!(url.contains("token=abc123"));
-    }
-
-    #[test]
-    fn websocket_error_message_is_extracted() {
-        let response = json!({
-            "type": "error",
-            "message": "bad token",
-        });
-        let error = expect_socket_message(response, "ack", Some("ping"))
-            .expect_err("error response should fail");
-        assert!(error.contains("bad token"));
-    }
-
-    #[test]
     fn extract_install_token_from_manifest_content_works() {
         let token = "a".repeat(96);
         let manifest = test_manifest(&token);
@@ -1596,6 +1501,7 @@ mod tests {
         let header = include_str!("../include/devstore_sdk.h");
         assert!(header.contains("init_sdk_for_user"));
         assert!(header.contains("set_presence_for_user"));
+        assert!(header.contains("discord_heartbeat"));
         assert!(header.contains("discord_quit"));
         assert!(header.contains("verify_download_code"));
         assert!(header.contains("verify_resigned_install_token"));
