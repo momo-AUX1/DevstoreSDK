@@ -193,6 +193,17 @@ struct DiscordInitResponse {
     discord_uid: String,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct DeviceFlowStartResponse {
+    code: String,
+    approval_url: String,
+    expires_in: u64,
+    #[serde(default)]
+    poll_url: Option<String>,
+    #[serde(default)]
+    qrcode_url: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct DiscordSessionState {
     session_token: String,
@@ -512,6 +523,79 @@ fn request_discord_init(
         .map_err(|e| format!("Failed to parse Discord init response: {}", e))
 }
 
+fn post_json_api(endpoint: &str, body: Value) -> Result<String, String> {
+    let client = build_http_client()?;
+    let response = client
+        .post(format!("{}{}", api_base_url(), endpoint))
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .send()
+        .map_err(|e| format!("Request failed: {}", format_error_chain(&e)))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .unwrap_or_else(|_| "No response body".to_string());
+
+    if !status.is_success() {
+        if let Ok(json) = parse_json_response(&text) {
+            let message = json
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Request failed.");
+            return Err(message.to_string());
+        }
+        return Err(text);
+    }
+
+    Ok(text)
+}
+
+fn request_device_flow_start(endpoint: &str, body: Value) -> Result<String, String> {
+    let text = post_json_api(endpoint, body)?;
+    let parsed = serde_json::from_str::<DeviceFlowStartResponse>(&text)
+        .map_err(|e| format!("Failed to parse device flow response: {}", e))?;
+
+    if parsed.code.trim().is_empty()
+        || parsed.approval_url.trim().is_empty()
+        || parsed.expires_in == 0
+    {
+        return Err("Device flow response is missing required fields.".to_string());
+    }
+    if endpoint.contains("/qr/") && (parsed.poll_url.is_none() || parsed.qrcode_url.is_none()) {
+        return Err("QR device flow response is missing poll_url or qrcode_url.".to_string());
+    }
+
+    Ok(text)
+}
+
+fn extract_secret_code_from_callback(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Missing callback_url parameter".to_string());
+    }
+
+    let normalized = if trimmed.starts_with('?') {
+        format!("https://devstore.local/{}", trimmed)
+    } else if trimmed.contains("://") {
+        trimmed.to_string()
+    } else if trimmed.contains('?') {
+        format!("https://devstore.local/{}", trimmed)
+    } else {
+        format!("https://devstore.local/?{}", trimmed)
+    };
+
+    let parsed =
+        reqwest::Url::parse(&normalized).map_err(|e| format!("Invalid callback URL: {}", e))?;
+    for (key, value) in parsed.query_pairs() {
+        if key == "secret_code" && !value.is_empty() {
+            return Ok(value.into_owned());
+        }
+    }
+
+    Err("secret_code was not found in the callback URL.".to_string())
+}
+
 fn current_discord_session() -> Option<DiscordSessionState> {
     DISCORD_SESSION.lock().unwrap().clone()
 }
@@ -664,6 +748,69 @@ pub extern "C" fn init_sdk_for_user(
             "Discord session ready for {} (expires in {}s, heartbeat {}s, discord uid {}).",
             username, expires_in, heartbeat_interval, discord_uid
         ))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn start_oauth_device_flow(
+    product_id: *const c_char,
+    return_url: *const c_char,
+) -> *mut DevstoreFfiMessage {
+    ffi_boundary(|| {
+        let product_id = match parse_c_string(product_id, "product_id") {
+            Ok(value) => value,
+            Err(err) => return err,
+        };
+        let return_url = match parse_c_string(return_url, "return_url") {
+            Ok(value) => value,
+            Err(err) => return err,
+        };
+
+        match request_device_flow_start(
+            "device/return-url/start/",
+            json!({
+                "product_id": product_id,
+                "return_url": return_url,
+            }),
+        ) {
+            Ok(payload) => message_success(payload),
+            Err(err) => message_error(err),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn start_qr_device_flow(product_id: *const c_char) -> *mut DevstoreFfiMessage {
+    ffi_boundary(|| {
+        let product_id = match parse_c_string(product_id, "product_id") {
+            Ok(value) => value,
+            Err(err) => return err,
+        };
+
+        match request_device_flow_start(
+            "device/qr/start/",
+            json!({
+                "product_id": product_id,
+            }),
+        ) {
+            Ok(payload) => message_success(payload),
+            Err(err) => message_error(err),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn get_code_from_oauth(callback_url: *const c_char) -> *mut DevstoreFfiMessage {
+    ffi_boundary(|| {
+        let callback_url = match parse_c_string(callback_url, "callback_url") {
+            Ok(value) => value,
+            Err(err) => return err,
+        };
+
+        match extract_secret_code_from_callback(callback_url) {
+            Ok(secret_code) => message_success(secret_code),
+            Err(err) => message_error(err),
+        }
     })
 }
 
@@ -1500,11 +1647,21 @@ mod tests {
     fn committed_header_contains_new_exports() {
         let header = include_str!("../include/devstore_sdk.h");
         assert!(header.contains("init_sdk_for_user"));
+        assert!(header.contains("start_oauth_device_flow"));
+        assert!(header.contains("start_qr_device_flow"));
+        assert!(header.contains("get_code_from_oauth"));
         assert!(header.contains("set_presence_for_user"));
         assert!(header.contains("discord_heartbeat"));
         assert!(header.contains("discord_quit"));
         assert!(header.contains("verify_download_code"));
         assert!(header.contains("verify_resigned_install_token"));
         assert!(header.contains("verify_resigned_package_path"));
+    }
+
+    #[test]
+    fn get_code_from_oauth_extracts_secret_code() {
+        let extracted = extract_secret_code_from_callback("test:///callback?secret_code=ABC123")
+            .expect("secret code should parse");
+        assert_eq!(extracted, "ABC123");
     }
 }

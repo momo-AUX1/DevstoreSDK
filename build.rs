@@ -41,6 +41,9 @@ DevstoreFfiMessage* verify_download_code(const char* product_id, const char* cod
 DevstoreFfiMessage* verify_resigned_install_token(const char* product_id, const char* install_token);
 DevstoreFfiMessage* verify_resigned_package_path(const char* product_id, const char* package_or_root_path);
 DevstoreFfiMessage* init_sdk_for_user(const char* product_id, const char* secret_code);
+DevstoreFfiMessage* start_oauth_device_flow(const char* product_id, const char* return_url);
+DevstoreFfiMessage* start_qr_device_flow(const char* product_id);
+DevstoreFfiMessage* get_code_from_oauth(const char* callback_url);
 DevstoreFfiMessage* set_presence_for_user(const char* details);
 DevstoreFfiMessage* discord_heartbeat(void);
 DevstoreFfiMessage* discord_quit(void);
